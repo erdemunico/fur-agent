@@ -1,6 +1,36 @@
 import pandas as pd
 import glob
 
+
+def dedupe_columns_keep_left(df):
+    """Aynı isimli sütunlarda ilk (soldaki) sütunu bırakır; concat için gerekli."""
+    seen = set()
+    keep_idx = []
+    for i, col in enumerate(df.columns):
+        if col in seen:
+            continue
+        seen.add(col)
+        keep_idx.append(i)
+    return df.iloc[:, keep_idx].copy()
+
+
+def drop_blank_named_columns(df):
+    """Başlığı boş veya eksik (NaN) olan sütunları kaldırır; sadece bu scriptteki birleşimi sadeleştirir."""
+
+    def _is_blank(name):
+        if isinstance(name, str):
+            return name.strip() == ""
+        try:
+            return bool(pd.isna(name))
+        except (TypeError, ValueError):
+            return False
+
+    to_drop = [c for c in df.columns if _is_blank(c)]
+    if not to_drop:
+        return df
+    return df.drop(columns=to_drop)
+
+
 all_android = []
 all_ios = []
 
@@ -32,6 +62,8 @@ for f in files:
         and_cols = [level_col_idx] + [i for i, v in enumerate(os_row_vals) if v == 'Android']
         df_and = df_raw.iloc[level_row_idx + 1:, and_cols].copy()
         df_and.columns = df_raw.iloc[level_row_idx, and_cols].tolist()
+        df_and = dedupe_columns_keep_left(df_and)
+        df_and = drop_blank_named_columns(df_and)
         df_and['SourceFile'] = f
         all_android.append(df_and)
         
@@ -39,6 +71,8 @@ for f in files:
         ios_cols = [level_col_idx] + [i for i, v in enumerate(os_row_vals) if v == 'iOS']
         df_ios = df_raw.iloc[level_row_idx + 1:, ios_cols].copy()
         df_ios.columns = df_raw.iloc[level_row_idx, ios_cols].tolist()
+        df_ios = dedupe_columns_keep_left(df_ios)
+        df_ios = drop_blank_named_columns(df_ios)
         df_ios['SourceFile'] = f
         all_ios.append(df_ios)
         
@@ -47,6 +81,7 @@ for f in files:
         # Header is level_row_idx
         df_flat = df_raw.iloc[level_row_idx + 1:].copy()
         df_flat.columns = df_raw.iloc[level_row_idx].tolist()
+        df_flat = dedupe_columns_keep_left(df_flat)
         df_flat = df_flat.dropna(subset=['Level']) # filter out grand total if any?
         # Actually grand total might not have level.
         df_flat['SourceFile'] = f
@@ -57,7 +92,9 @@ for f in files:
         
         df_and = df_and.drop(columns=['Operating system'], errors='ignore')
         df_ios = df_ios.drop(columns=['Operating system'], errors='ignore')
-        
+        df_and = drop_blank_named_columns(df_and)
+        df_ios = drop_blank_named_columns(df_ios)
+
         all_android.append(df_and)
         all_ios.append(df_ios)
 

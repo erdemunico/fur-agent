@@ -2,10 +2,14 @@
 import pandas as pd
 import openpyxl
 from openpyxl.descriptors.base import Set
+from openpyxl.styles import PatternFill
+from openpyxl.formatting.rule import FormulaRule
 import glob
 import sys
 import warnings
 import re
+from datetime import datetime
+import errno
 
 # ===================================================================
 # Monkeypatch openpyxl Set validation to bypass "invalid XML" errors
@@ -240,6 +244,74 @@ def shift_formula(formula, shift):
     return re.sub(pattern, replace_match, formula)
 
 
+# Kod analizi: Drop 1 (H) ve % / K sütunu (K) — formüller Excel'de hesaplanır; renk CF ile.
+# Drop 1: >%10 kirmizi, %8.5–10 (dahil) sari.
+# K (%): Level araliklarina gore step esikler (renklendirme araligi net):
+# - Level <=20  : yesil >50, sari 45-50, kirmizi <45
+# - 21-30        : yesil >30, sari 25-30, kirmizi <25
+# - 31-50        : yesil >15, sari 12-15, kirmizi <12
+# - 51-100       : yesil >7,  sari 5-7,   kirmizi <5
+_CF_FILL_GREEN = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+_CF_FILL_YELLOW = PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid')
+_CF_FILL_RED = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+
+# Excel IF zinciri (K esik degerleri):
+# - g: yesil esigi (ustu yesil)
+# - y: sari bandin alt esigi (y ile g arasi sari)
+_K_THRESH_G = 'IF($A3<=20,50,IF($A3<=30,30,IF($A3<=50,15,7)))'
+_K_THRESH_Y = 'IF($A3<=20,45,IF($A3<=30,25,IF($A3<=50,12,5)))'
+
+
+def apply_drop1_and_k_conditional_formatting(ws, last_row):
+    """And / IOS: H (Drop 1) ve K (%) için koşullu dolgu. Formüller hesaplandıktan sonra Excel uygular."""
+    if last_row < 3:
+        return
+    h_range = f'H3:H{last_row}'
+    k_range = f'K3:K{last_row}'
+    # Drop 1: sadece sayı varsa renklendir; boş/hata -> beyaz (varsayılan)
+    ws.conditional_formatting.add(
+        h_range,
+        FormulaRule(formula=['AND(ISNUMBER(H3),H3>10)'], fill=_CF_FILL_RED, stopIfTrue=True),
+    )
+    ws.conditional_formatting.add(
+        h_range,
+        FormulaRule(
+            formula=['AND(ISNUMBER(H3),H3>=8.5,H3<=10)'],
+            fill=_CF_FILL_YELLOW,
+            stopIfTrue=True,
+        ),
+    )
+    # K (%): sadece hem Level (A3) hem K sayisal ise renk; bos/metin -> renk yok
+    ws.conditional_formatting.add(
+        k_range,
+        FormulaRule(
+            formula=[f'AND(ISNUMBER($A3),ISNUMBER(K3),K3>({_K_THRESH_G}))'],
+            fill=_CF_FILL_GREEN,
+            stopIfTrue=True,
+        ),
+    )
+    ws.conditional_formatting.add(
+        k_range,
+        FormulaRule(
+            formula=[
+                f'AND(ISNUMBER($A3),ISNUMBER(K3),K3>=({_K_THRESH_Y}),K3<=({_K_THRESH_G}))'
+            ],
+            fill=_CF_FILL_YELLOW,
+            stopIfTrue=True,
+        ),
+    )
+    ws.conditional_formatting.add(
+        k_range,
+        FormulaRule(
+            formula=[
+                f'AND(ISNUMBER($A3),ISNUMBER(K3),K3<({_K_THRESH_Y}))'
+            ],
+            fill=_CF_FILL_RED,
+            stopIfTrue=True,
+        ),
+    )
+
+
 def write_tab_data(wb, sheet_name, data_by_funnel, col_map, max_level, revenue_df=None):
     """
     Belirli bir sekme icin verileri funnel haritasina gore yazdirir.
@@ -327,6 +399,26 @@ def write_tab_data(wb, sheet_name, data_by_funnel, col_map, max_level, revenue_d
             for c_idx, f_str in formula_cols:
                 shifted_f = shift_formula(f_str, shift)
                 ws.cell(row=t_row, column=c_idx).value = shifted_f
+
+    # 5b. K (%) sütunu:
+    # - Level 1..100: şablondaki formül yazılır
+    # - Level >100 : boş bırakılır (gösterilmez)
+    # Formül: L1 Complete (satır 3, C3) ile bir alt satırdaki C sütunu arasındaki oran; yüzde cinsinden.
+    if sheet_name in ('And', 'IOS'):
+        for level in range(1, max_level + 1):
+            t_row = level_rows[level]
+            if level <= 100:
+                ws.cell(row=t_row, column=11).value = (
+                    f'=100-(((C3-C{t_row + 1})/C3)*100)'
+                )
+            else:
+                ws.cell(row=t_row, column=11).value = None
+
+    if sheet_name in ('And', 'IOS'):
+        # Sadece bizim doldurduğumuz max_level araligina kadar renklendirme yap
+        # (template'te daha uzun seviyeler tanimli olsa bile).
+        last_row_fmt = level_rows.get(max_level, max_level + 2)
+        apply_drop1_and_k_conditional_formatting(ws, last_row_fmt)
 
     print(f"   OK '{sheet_name}' tablosu yazildi (Level 1-{max_level}).")
 
@@ -444,7 +536,20 @@ def main():
     write_tab_data(wb, 'Boosters_IOS', data_ios,     BOOSTER_COL_MAP, max_level)
 
     print("\n5. Sonuc dosyasi kaydediliyor...")
-    wb.save(output_path)
+    try:
+        print(f"   -> Kaydediliyor: {output_path}")
+        wb.save(output_path)
+    except Exception as e:
+        # Windows'ta çıktı dosyası Excel'de açıkken yazma kilitlenir (errno 13).
+        if not (isinstance(e, PermissionError) or getattr(e, "errno", None) == errno.EACCES):
+            raise
+        alt = f"Hole_Pool_Otomatik_Analiz_v1_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        print(
+            f"UYARI: '{output_path}' yazilamadi (dosya Excel'de acik olabilir — kapatip tekrar deneyin).\n"
+            f"        Alternatif dosyaya yaziliyor: {alt}"
+        )
+        wb.save(alt)
+        output_path = alt
     print("=======================================================")
     print(f" BASARILI: {output_path}")
     print("=======================================================\n")
