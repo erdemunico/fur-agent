@@ -1,5 +1,6 @@
-# Excel — surekli degisen veri/sablon/cikti dosyalari (GitHub'da tutulmaz)
+# Excel — surekli degisen veri/cikti dosyalari (GitHub'da tutulmaz)
 *.xlsx
+!Hole_Pool_Otomatik_Analiz_v1_US_20260325-20260331_20260401_212238.xlsx
 *.xls
 *.xlsm
 *.xlsb

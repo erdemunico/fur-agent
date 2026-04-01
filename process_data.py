@@ -18,6 +18,11 @@ from copy import deepcopy
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Calisma kitabi sablonu (SCRIPT_DIR'de tam bu dosya adi; Git'te izlenir)
+WORKBOOK_TEMPLATE_XLSX = (
+    "Hole_Pool_Otomatik_Analiz_v1_US_20260325-20260331_20260401_212238.xlsx"
+)
+
 # ARPU / Av.Rw grafikleri bu referans dosyadan kopyalanir (U,V,W -> And!O / IOS!O, And!T / IOS!T)
 ARPU_CHART_REFERENCE_XLSX = "Hole_Pool_Otomatik_Analiz_v1_US_20260319-20260325.xlsx"
 
@@ -51,7 +56,10 @@ def _is_output_workbook(basename: str) -> bool:
 
 
 def _is_template_workbook(basename: str) -> bool:
-    return str(basename).startswith("Copy of Hole_Pool")
+    b = str(basename)
+    if b.startswith("Copy of Hole_Pool"):
+        return True
+    return b.casefold() == WORKBOOK_TEMPLATE_XLSX.casefold()
 
 
 def _xlsx_rows_look_like_data(df_check) -> bool:
@@ -992,12 +1000,13 @@ def main():
 
     # 4. Yazma Islemi
     print("4. Sablona yaziliyor...")
-    template_files = glob.glob(os.path.join(SCRIPT_DIR, "Copy of Hole_Pool*.xlsx"))
-    if not template_files:
-        print("HATA: Sablon bulunamadi.")
+    template_path = os.path.join(SCRIPT_DIR, WORKBOOK_TEMPLATE_XLSX)
+    if not os.path.isfile(template_path):
+        print(
+            f"HATA: Sablon bulunamadi: {WORKBOOK_TEMPLATE_XLSX}\n"
+            f"      Beklenen konum: {os.path.normpath(template_path)}"
+        )
         sys.exit(1)
-
-    template_path = template_files[0]
 
     # --- Output dosya adi: ulke kisaltmasi + analiz tarih araligi ---
     # unique_dates daha once, #hole-pool iceren dosyalardan cikartiliyordu.
@@ -1028,13 +1037,18 @@ def main():
         return m.get(x, x)
 
     country_code = "XX"
-    m = re.search(r"Hole_Pool_([A-Za-z]+)_", template_path)
+    tmpl_bn = os.path.basename(template_path)
+    m = re.search(r"Hole_Pool_Otomatik_Analiz_v1_([A-Za-z]+)_", tmpl_bn, re.I)
     if m:
         country_code = normalize_country_code(m.group(1))
     else:
-        m2 = re.search(r"Hole_Pool_([A-Za-z]+)", template_path)
+        m2 = re.search(r"Hole_Pool_([A-Za-z]+)_", tmpl_bn)
         if m2:
             country_code = normalize_country_code(m2.group(1))
+        else:
+            m3 = re.search(r"Hole_Pool_([A-Za-z]+)", tmpl_bn)
+            if m3:
+                country_code = normalize_country_code(m3.group(1))
 
     output_path = os.path.join(
         SCRIPT_DIR,
