@@ -6,6 +6,9 @@
 ~$*.xlsx
 ~$*.xls*
 
+# Gelir / veri CSV (yerel exportlar)
+veri-*.csv
+
 # Script debug / yerel log
 debug-fb19ec.log
 
