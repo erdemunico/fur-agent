@@ -1,0 +1,14 @@
+# Excel — surekli degisen veri/sablon/cikti dosyalari (GitHub'da tutulmaz)
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+~$*.xlsx
+~$*.xls*
+
+# Script debug / yerel log
+debug-fb19ec.log
+
+# Python
+__pycache__/
+*.py[cod]
