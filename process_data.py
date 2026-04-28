@@ -52,7 +52,8 @@ def _agent_debug_log(hypothesis_id, location, message, data=None, run_id="run1")
 
 
 def _is_output_workbook(basename: str) -> bool:
-    return str(basename).lower().startswith("hole_pool_otomatik_analiz")
+    b = str(basename).lower()
+    return "_otomatik_analiz" in b
 
 
 def _is_template_workbook(basename: str) -> bool:
@@ -62,13 +63,50 @@ def _is_template_workbook(basename: str) -> bool:
     return b.casefold() == WORKBOOK_TEMPLATE_XLSX.casefold()
 
 
+def _normalize_game_name_for_filename(game_name: str) -> str:
+    """
+    Oyun adini dosya-adina uygun hale getirir.
+    Ornek: 'Farm Block Escape' -> 'Farm_Block_Escape'
+    """
+    s = str(game_name or "").strip()
+    if not s:
+        return "Hole_Pool"
+    s = re.sub(r"[^A-Za-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "Hole_Pool"
+
+
+def _extract_game_name_from_metadata(df_check):
+    """
+    Metaveriden oyun adini cikarir (oncelik: hashtag satiri).
+    Ornekler:
+    - '# hole-pool' -> 'hole-pool'
+    - '# FARM BLOCK ESCAPE' -> 'FARM BLOCK ESCAPE'
+    """
+    if df_check is None or df_check.empty:
+        return None
+    head = df_check.head(min(15, len(df_check)))
+    blob = " ".join(head.fillna("").astype(str).values.flatten())
+
+    m = re.search(r"#\s*([A-Za-z0-9][A-Za-z0-9 _-]{1,80})", blob)
+    if m:
+        raw = m.group(1).strip(" -_")
+        if raw:
+            return raw
+    return None
+
+
 def _xlsx_rows_look_like_data(df_check) -> bool:
     """# hole-pool etiketi veya Free form tarzi (OS + Level + funnel) yapi."""
     if df_check is None or df_check.empty:
         return False
+    # 1) Once metaveri kontrolu (oyun etiketi)
+    if _extract_game_name_from_metadata(df_check):
+        return True
     content_str = " ".join(df_check.fillna("").astype(str).values.flatten()).lower()
     if "# hole-pool" in content_str:
         return True
+    # 2) Metaveri yoksa free-form kolon yapisi
     head = df_check.head(min(15, len(df_check)))
     blob = " ".join(head.fillna("").astype(str).values.flatten()).lower()
     if "operating system" not in blob or "level" not in blob:
@@ -86,6 +124,7 @@ def collect_data_xlsx_files(script_dir):
 
     files = []
     date_dict = {}
+    game_dict = {}
     skipped = []
 
     for path in all_paths:
@@ -105,6 +144,8 @@ def collect_data_xlsx_files(script_dir):
             skipped.append((base, "veri yapisi (hole-pool / OS+Level) yok"))
             continue
         files.append(path)
+        game_name = _extract_game_name_from_metadata(df_check)
+        game_dict[path] = game_name
         found_date = None
         for idx, row in df_check.iterrows():
             row_str = " ".join(row.dropna().astype(str))
@@ -114,7 +155,7 @@ def collect_data_xlsx_files(script_dir):
                 break
         date_dict[path] = found_date or "Tarih Bulunamadi"
 
-    return files, date_dict, skipped
+    return files, date_dict, game_dict, skipped
 
 
 # ===================================================================
@@ -933,7 +974,7 @@ def main():
     # 1. Veri dosyalarini SCRIPT_DIR icinde tara (cwd'den bagimsiz)
     print("1. Veri dosyalari (xlsx) taraniyor...")
     print(f"   Klasor: {os.path.normpath(SCRIPT_DIR)}")
-    files, date_dict, skipped = collect_data_xlsx_files(SCRIPT_DIR)
+    files, date_dict, game_dict, skipped = collect_data_xlsx_files(SCRIPT_DIR)
 
     if not files:
         print("HATA: Gecerli veri dosyasi bulunamadi (hole-pool etiketi veya OS+Level+funnel yapisinda xlsx).")
@@ -948,6 +989,17 @@ def main():
     if skipped:
         print(f"   Bilgi: {len(skipped)} dosya atlandi (sablon/cikti veya veri degil).")
     print(f"   OK {len(files)} adet veri dosyasi tespit edildi.")
+    game_names = [g for g in game_dict.values() if g]
+    if game_names:
+        # Birden fazla oyun etiketi varsa en sik geceni baz al.
+        game_counter = {}
+        for g in game_names:
+            game_counter[g] = game_counter.get(g, 0) + 1
+        detected_game = sorted(game_counter.items(), key=lambda x: (-x[1], x[0]))[0][0]
+        print(f"   OK Oyun metaverisi: {detected_game}")
+    else:
+        detected_game = "Hole_Pool"
+        print("   UYARI: Oyun metaverisi bulunamadi; varsayilan ad kullanilacak (Hole_Pool).")
     unique_dates = set(date_dict.values())
     if len(unique_dates) > 1:
         print(f"   UYARI: Tarih farkliligi var: {unique_dates}")
@@ -1050,9 +1102,10 @@ def main():
             if m3:
                 country_code = normalize_country_code(m3.group(1))
 
+    game_slug = _normalize_game_name_for_filename(detected_game)
     output_path = os.path.join(
         SCRIPT_DIR,
-        f"Hole_Pool_Otomatik_Analiz_v1_{country_code}_{date_range_safe}.xlsx",
+        f"{game_slug}_Otomatik_Analiz_v1_{country_code}_{date_range_safe}.xlsx",
     )
 
     try:
