@@ -2,7 +2,7 @@
 import pandas as pd
 import openpyxl
 from openpyxl.descriptors.base import Set
-from openpyxl.styles import PatternFill
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import FormulaRule
 import glob
@@ -25,6 +25,13 @@ WORKBOOK_TEMPLATE_XLSX = (
 
 # ARPU / Av.Rw grafikleri bu referans dosyadan kopyalanir (U,V,W -> And!O / IOS!O, And!T / IOS!T)
 ARPU_CHART_REFERENCE_XLSX = "Hole_Pool_Otomatik_Analiz_v1_US_20260319-20260325.xlsx"
+
+# Ozet sekmesi: erken level / segmentasyon kalite analizi
+SUMMARY_SHEET_NAME = "Ozet"
+QUALITY_MIN_USERS = 10
+QUALITY_COVERAGE_RATIO = 0.05
+QUALITY_CONSECUTIVE_LEVELS = 3
+QUALITY_REF_WINDOW = 40
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(SCRIPT_DIR, "debug-fb19ec.log")
@@ -178,13 +185,18 @@ warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 # And / IOS sekmeleri icin harita
 GENEL_COL_MAP = {
     ('Active users',    'Start'):    2,
+    ('Total users',     'Start'):    2,
     ('Active users',    'Complete'): 3,
+    ('Total users',     'Complete'): 3,
     ('Active users',    'Fail'):     4,
+    ('Total users',     'Fail'):     4,
     ('Active users',    'Tryagain'): 5,
+    ('Total users',     'Tryagain'): 5,
     ('avarage_attempt', 'Complete'): 12,
     ('avg_thinktime',   'Complete'): 19,
-    ('Total users',     'ADs'):      20, # ham ADs; T (20) Python ile rewarded/complete orani yazilir
-    # U (21) avg. owned coin: Complete coin_owned / Complete Active users — write_and_ios_t_u_columns
+    ('Total users',     'ADs'):      20,  # ham ADs; T (20) Python ile rewarded/complete orani
+    ('Active users',    'ADs'):      20,
+    # U (21) avg. owned coin: Complete coin_owned / kullanici sayisi — write_and_ios_t_u_columns
 }
 
 # Booster sekmeleri icin harita
@@ -201,7 +213,8 @@ BOOSTER_COL_MAP = {
     ('booster_a_owned', 'Fail'):     18,
     ('booster_b_owned', 'Fail'):     19,
     ('booster_c_owned', 'Fail'):     20,
-    ('Total users',     'ADs'):      21, # Total Rewarded
+    ('Total users',     'ADs'):      21,  # Total Rewarded
+    ('Active users',    'ADs'):      21,
 }
 
 def get_max_level_from_user():
@@ -261,6 +274,22 @@ _COIN_CANON = "coin_owned"
 _COIN_ALIASES = frozenset(
     {"coin_owned", "owned_coin", "coinowned", "ownedcoin", "coins_owned", "owned_coins"}
 )
+_USER_COUNT_CANON = "user_count"
+_USER_COUNT_ALIASES = frozenset(
+    {"active_users", "total_users", "activeusers", "totalusers"}
+)
+
+# Funnel tipi tespiti (ust satir / Segment); uzun eslesmeler once
+_FUNNEL_DETECT_RULES = (
+    ("try again", "Tryagain"),
+    ("tryagain", "Tryagain"),
+    ("complete", "Complete"),
+    ("fail", "Fail"),
+    ("rewarded", "ADs"),
+    ("adtype", "ADs"),
+    ("ads", "ADs"),
+    ("start", "Start"),
+)
 
 
 def _canonical_metric_name(name):
@@ -268,6 +297,8 @@ def _canonical_metric_name(name):
     k = _norm_metric_token(_base_col_name(name))
     if k in _COIN_ALIASES:
         return _COIN_CANON
+    if k in _USER_COUNT_ALIASES:
+        return _USER_COUNT_CANON
     return k
 
 
@@ -275,6 +306,8 @@ def _canonical_target_base(target_base):
     k = _norm_metric_token(target_base)
     if k in _COIN_ALIASES:
         return _COIN_CANON
+    if k in _USER_COUNT_ALIASES:
+        return _USER_COUNT_CANON
     return k
 
 
@@ -358,11 +391,11 @@ def write_and_ios_t_u_columns(wb, sheet_name, data_by_funnel, max_level):
 def detect_funnel_type(df_raw):
     """Dosyanin meta basliginda funnel turunu tespit et."""
     for idx in range(min(10, len(df_raw))):
-        row_str = " ".join(df_raw.iloc[idx].dropna().astype(str))
-        for keyword in ['Complete', 'Fail', 'Tryagain', 'Start', 'ADs']:
-            if keyword.lower() in row_str.lower():
-                return keyword
-    return 'Unknown'
+        row_str = " ".join(df_raw.iloc[idx].dropna().astype(str)).lower()
+        for needle, ftype in _FUNNEL_DETECT_RULES:
+            if needle in row_str:
+                return ftype
+    return "Unknown"
 
 
 def read_platform_data(f):
@@ -951,7 +984,631 @@ def write_tab_data(wb, sheet_name, data_by_funnel, col_map, max_level, revenue_d
         last_row_fmt = level_rows.get(max_level, max_level + 2)
         apply_drop1_and_k_conditional_formatting(ws, last_row_fmt)
 
+    if sheet_name in ("Boosters_And", "Boosters_IOS"):
+        _apply_booster_pct_used_formulas(ws, sheet_name, max_level, level_rows)
+
     print(f"   OK '{sheet_name}' tablosu yazildi (Level 1-{max_level}).")
+
+
+def _apply_booster_pct_used_formulas(ws, sheet_name, max_level, level_rows):
+    """
+    I sutunu (%_used_booster): her platform kendi sekmesini kullanir.
+    Ornek: =(Boosters_IOS!B14*100)/Boosters_IOS!N14
+    """
+    if sheet_name not in ("Boosters_And", "Boosters_IOS"):
+        return
+    prefix = f"{sheet_name}!"
+    for level in range(1, max_level + 1):
+        r = level_rows.get(level, level + 2)
+        ws.cell(row=r, column=9).value = f"=({prefix}B{r}*100)/{prefix}N{r}"
+
+
+def _level_user_series(df, max_level):
+    """Funnel DataFrame'den level -> kullanici sayisi (Active/Total users)."""
+    if df is None or df.empty or "Level" not in df.columns:
+        return {}
+    sub = df.copy()
+    sub["Level"] = pd.to_numeric(sub["Level"], errors="coerce")
+    sub = sub.dropna(subset=["Level"])
+    if sub.empty:
+        return {}
+    sub["Level"] = sub["Level"].astype(int)
+    user_cols = [
+        c for c in sub.columns if c != "Level" and _canonical_metric_name(c) == _USER_COUNT_CANON
+    ]
+    if not user_cols:
+        return {}
+    for c in user_cols:
+        sub[c] = pd.to_numeric(sub[c], errors="coerce").fillna(0)
+    grouped = sub.groupby("Level")[user_cols].sum()
+    out = {}
+    for lvl, row in grouped.iterrows():
+        li = int(lvl)
+        if li < 1 or li > max_level:
+            continue
+        out[li] = float(row.sum())
+    return out
+
+
+def _find_reliable_start_level(level_counts, ref_window=QUALITY_REF_WINDOW):
+    """
+    Erken level'lerde dusuk/eksik kullanici (segmentasyon artefakti) tespiti.
+    Doner: (onerilen_baslangic_level, guvensiz_level_listesi, aciklama_listesi)
+    """
+    notes = []
+    if not level_counts:
+        return 1, [], ["Kullanici sayisi serisi bos."]
+
+    sorted_lc = sorted(level_counts.items())
+    early = [(l, c) for l, c in sorted_lc if l <= ref_window]
+    pool = early if early else sorted_lc[: min(30, len(sorted_lc))]
+    ref = max((c for _, c in pool), default=0.0)
+    if ref <= 0:
+        ref = max((c for _, c in sorted_lc), default=0.0)
+    if ref <= 0:
+        return 1, [l for l, _ in sorted_lc], ["Tum level'larda kullanici 0."]
+
+    threshold = max(QUALITY_MIN_USERS, ref * QUALITY_COVERAGE_RATIO)
+    unreliable = [l for l, c in sorted_lc if c < threshold]
+
+    first_ok = None
+    streak = 0
+    for l, c in sorted_lc:
+        if c >= threshold:
+            streak += 1
+            if streak >= QUALITY_CONSECUTIVE_LEVELS:
+                first_ok = l - QUALITY_CONSECUTIVE_LEVELS + 1
+                break
+        else:
+            streak = 0
+
+    if first_ok is None:
+        first_ok = sorted_lc[0][0]
+        notes.append("Ardisik guvenilir band bulunamadi; ilk veri level'i kullanildi.")
+
+    l1_count = level_counts.get(1, 0.0)
+    if l1_count > 0 and ref > 0 and l1_count < ref * QUALITY_COVERAGE_RATIO:
+        notes.append(
+            f"Level 1 kullanici ({int(l1_count)}) zirve bandina gore dusuk; "
+            "user property segmentasyonu erken level'leri eksik gosterebilir."
+        )
+    if first_ok > 1:
+        notes.append(
+            f"Guvenilir analiz icin Level {first_ok}+ onerilir "
+            f"(Level 1-{first_ok - 1} dusuk orneklem)."
+        )
+
+    return first_ok, unreliable, notes
+
+
+def _first_positive_level(level_counts):
+    for l, c in sorted(level_counts.items()):
+        if c > 0:
+            return l
+    return None
+
+
+def _missing_level_gaps(level_counts, max_level):
+    if not level_counts:
+        return []
+    lo = min(level_counts.keys())
+    hi = min(max(level_counts.keys()), max_level)
+    return [l for l in range(lo, hi + 1) if l not in level_counts]
+
+
+def _analyze_platform_quality(data_by_funnel, max_level, platform_label):
+    """Tek platform (Android/iOS) icin detayli kalite raporu."""
+    funnels = ("Start", "Complete", "Fail", "Tryagain", "ADs")
+    series = {ft: _level_user_series(data_by_funnel.get(ft), max_level) for ft in funnels}
+    funnel_first = {ft: _first_positive_level(series[ft]) for ft in funnels}
+
+    funnel_starts = []
+    for ft in ("Start", "Complete", "Fail", "Tryagain"):
+        if series[ft]:
+            rel, _, _ = _find_reliable_start_level(series[ft])
+            funnel_starts.append(rel)
+    recommended_funnel = max(funnel_starts) if funnel_starts else 1
+
+    recommended_ads = 1
+    if series["ADs"]:
+        recommended_ads, _, ads_notes = _find_reliable_start_level(series["ADs"])
+    else:
+        ads_notes = []
+
+    recommended = recommended_funnel
+
+    all_notes = []
+    for ft in funnels:
+        if funnel_first[ft] and funnel_first[ft] > 1:
+            all_notes.append(f"{ft}: ilk veri Level {funnel_first[ft]}")
+
+    _, _, start_notes = _find_reliable_start_level(series["Start"])
+    all_notes.extend(start_notes)
+    if recommended_ads > recommended_funnel:
+        all_notes.append(
+            f"ADs/rewarded verisi Level {recommended_ads}+ (T sutunu bu banddan sonra anlamli)."
+        )
+    all_notes.extend(ads_notes)
+
+    gaps = _missing_level_gaps(series["Start"] or series["Complete"], max_level)
+    if gaps and len(gaps) <= 25:
+        all_notes.append(f"Eksik level araligi (ornek): {gaps[:15]}")
+    elif gaps:
+        all_notes.append(f"Toplam {len(gaps)} eksik level (analytics export atlama).")
+
+    detail_cap = min(max_level, 120)
+    level_rows = []
+    for lvl in range(1, detail_cap + 1):
+        counts = {ft: int(series[ft].get(lvl, 0)) for ft in funnels}
+        reliable = lvl >= recommended_funnel and any(
+            counts[ft] for ft in ("Start", "Complete", "Fail", "Tryagain")
+        )
+        note_parts = []
+        if lvl < recommended_funnel:
+            note_parts.append("Funnel dusuk guven")
+        if funnel_first.get("ADs") and lvl < funnel_first["ADs"]:
+            note_parts.append("ADs henuz yok")
+        if not any(counts.values()):
+            note_parts.append("Veri yok")
+        level_rows.append(
+            {
+                "level": lvl,
+                "counts": counts,
+                "reliable": "Evet" if reliable else "Hayir",
+                "note": "; ".join(note_parts) if note_parts else "",
+            }
+        )
+
+    return {
+        "label": platform_label,
+        "recommended_level": recommended,
+        "recommended_funnel_level": recommended_funnel,
+        "recommended_ads_level": recommended_ads,
+        "funnel_first_level": funnel_first,
+        "series": series,
+        "warnings": all_notes,
+        "level_rows": level_rows,
+    }
+
+
+def _k_green_threshold(level):
+    if level <= 20:
+        return 50.0
+    if level <= 30:
+        return 50.0 - 2.0 * (level - 20)
+    if level <= 50:
+        return 30.0 - 0.75 * (level - 30)
+    if level <= 100:
+        return 15.0 - 0.16 * (level - 50)
+    return 7.0
+
+
+def _k_yellow_threshold(level):
+    if level <= 20:
+        return 45.0
+    if level <= 30:
+        return 45.0 - 2.0 * (level - 20)
+    if level <= 50:
+        return 25.0 - 0.65 * (level - 30)
+    if level <= 100:
+        return 12.0 - 0.14 * (level - 50)
+    return 5.0
+
+
+def _excel_k_pct(complete, level):
+    """And/IOS K (%) sutunu ile ayni mantik: L1 Complete vs (level+1) Complete."""
+    c1 = complete.get(1, 0.0)
+    c_next = complete.get(level + 1, 0.0)
+    if c1 <= 0:
+        return None
+    return 100.0 - ((c1 - c_next) / c1 * 100.0)
+
+
+def _drop1_pct(complete, level):
+    """Level -> level+1 Complete dususu (%). H (Drop 1) ile uyumlu."""
+    c = complete.get(level, 0.0)
+    c_next = complete.get(level + 1, 0.0)
+    if c <= 0:
+        return None
+    return (c - c_next) / c * 100.0
+
+
+def _classify_k(level, k_val):
+    if k_val is None:
+        return ""
+    g = _k_green_threshold(level)
+    y = _k_yellow_threshold(level)
+    if k_val > g:
+        return "Yesil"
+    if k_val >= y:
+        return "Sari"
+    return "Kirmizi"
+
+
+def _classify_drop1(drop_val):
+    if drop_val is None:
+        return ""
+    if drop_val > 10:
+        return "Kirmizi"
+    if drop_val >= 8.5:
+        return "Sari"
+    return "OK"
+
+
+def _churn_priority_score(k_cls, d_cls):
+    if d_cls == "Kirmizi":
+        return 3
+    if k_cls == "Kirmizi":
+        return 2
+    if d_cls == "Sari" or k_cls == "Sari":
+        return 1
+    return 0
+
+
+def _build_platform_churn(series, max_level, reliable_from):
+    """Platform churn tablolari: oncelikli leveller + bant ozeti."""
+    start = series.get("Start", {})
+    complete = series.get("Complete", {})
+    fail = series.get("Fail", {})
+    tryagain = series.get("Tryagain", {})
+    if not complete:
+        return {"hotspots": [], "bands": []}
+
+    lo = max(1, int(reliable_from))
+    hi = min(max_level, 200)
+    rows = []
+    for lvl in range(lo, hi + 1):
+        s = start.get(lvl, 0.0)
+        c = complete.get(lvl, 0.0)
+        k = _excel_k_pct(complete, lvl)
+        d1 = _drop1_pct(complete, lvl)
+        k_cls = _classify_k(lvl, k)
+        d_cls = _classify_drop1(d1)
+        prio = _churn_priority_score(k_cls, d_cls)
+        c_rate = (c / s * 100.0) if s > 0 else None
+        note = []
+        if d_cls == "Kirmizi":
+            note.append("Ani dusus (H)")
+        if k_cls == "Kirmizi":
+            note.append("Dusuk retention (K)")
+        if fail.get(lvl, 0) > 0 and c > 0 and fail.get(lvl, 0) / c > 0.3:
+            note.append("Yuksek Fail")
+        rows.append(
+            {
+                "level": lvl,
+                "start": int(s),
+                "complete": int(c),
+                "complete_rate": round(c_rate, 1) if c_rate is not None else None,
+                "k_pct": round(k, 1) if k is not None else None,
+                "k_class": k_cls,
+                "drop1_pct": round(d1, 1) if d1 is not None else None,
+                "drop1_class": d_cls,
+                "fail": int(fail.get(lvl, 0)),
+                "tryagain": int(tryagain.get(lvl, 0)),
+                "priority": prio,
+                "note": "; ".join(note),
+            }
+        )
+
+    hotspots = sorted(
+        [r for r in rows if r["priority"] > 0],
+        key=lambda x: (-x["priority"], -(x["drop1_pct"] or 0), -(x["k_pct"] or 0)),
+    )[:30]
+
+    band_defs = (
+        ("Erken", lo, min(30, hi)),
+        ("Orta", 31, min(100, hi)),
+        ("Gec", 101, hi),
+    )
+    bands = []
+    for name, b_lo, b_hi in band_defs:
+        if b_lo > b_hi:
+            continue
+        band_rows = [r for r in rows if b_lo <= r["level"] <= b_hi]
+        if not band_rows:
+            continue
+        rates = [r["complete_rate"] for r in band_rows if r["complete_rate"] is not None]
+        drops = [r["drop1_pct"] for r in band_rows if r["drop1_pct"] is not None]
+        bands.append(
+            {
+                "name": name,
+                "range": f"L{b_lo}-L{b_hi}",
+                "avg_complete_rate": round(sum(rates) / len(rates), 1) if rates else None,
+                "avg_drop1": round(sum(drops) / len(drops), 1) if drops else None,
+                "red_drop": sum(1 for r in band_rows if r["drop1_class"] == "Kirmizi"),
+                "yellow_drop": sum(1 for r in band_rows if r["drop1_class"] == "Sari"),
+                "red_k": sum(1 for r in band_rows if r["k_class"] == "Kirmizi"),
+                "levels_in_band": len(band_rows),
+            }
+        )
+
+    return {"hotspots": hotspots, "bands": bands}
+
+
+def build_data_quality_report(
+    data_android,
+    data_ios,
+    *,
+    game_name,
+    date_range,
+    country_code,
+    max_level,
+    source_files,
+):
+    """Tum platformlar icin ozet + kalite + churn raporu."""
+    platforms = {}
+    for label, data in (("Android", data_android), ("iOS", data_ios)):
+        if not any(
+            data.get(ft) is not None and not data.get(ft).empty for ft in ("Start", "Complete")
+        ):
+            platforms[label] = {
+                "label": label,
+                "recommended_level": 1,
+                "recommended_funnel_level": 1,
+                "recommended_ads_level": 1,
+                "funnel_first_level": {},
+                "warnings": ["Bu platform icin Start/Complete verisi yok."],
+                "level_rows": [],
+                "series": {},
+                "churn": {"hotspots": [], "bands": []},
+            }
+            continue
+        plat = _analyze_platform_quality(data, max_level, label)
+        plat["churn"] = _build_platform_churn(
+            plat["series"],
+            max_level,
+            plat.get("recommended_funnel_level", 1),
+        )
+        platforms[label] = plat
+
+    global_warn = [
+        "Analytics'te user property ile segmentasyon yapildiginda, ozellik "
+        "erken level'larda kullanici sayisi dusuk veya 0 gorunebilir. Bu gercek "
+        "drop degil; ozellik henuz set edilmemis veya funnel filtresine girmemis "
+        "kullanicilardan kaynaklanir.",
+        "And/IOS/K (%) analizinde Level 1-2 yerine asagidaki 'Onerilen baslangic' "
+        "level'inden itibaren yorum yapin.",
+        "Drop-off (K) ve Drop 1 (H) formulleri dusuk level'de yanıltici olabilir; "
+        "guvenilir band sonrasi trendlere odaklanin.",
+    ]
+    for pk, short in (("Android", "And"), ("iOS", "IOS")):
+        p = platforms.get(pk, {})
+        rf = p.get("recommended_funnel_level", p.get("recommended_level", 1))
+        ra = p.get("recommended_ads_level", 1)
+        global_warn.append(
+            f"{pk}: funnel (K/H) L{rf}+ | ADs/rewarded (T) L{ra}+"
+        )
+
+    return {
+        "game_name": game_name,
+        "date_range": date_range,
+        "country_code": country_code,
+        "max_level": max_level,
+        "source_files": [os.path.basename(p) for p in source_files],
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "platforms": platforms,
+        "global_warnings": global_warn,
+    }
+
+
+def _ozet_set_cell(ws, row, col, value, *, bold=False, fill=None, wrap=False):
+    c = ws.cell(row=row, column=col, value=value)
+    if bold:
+        c.font = Font(bold=True)
+    if fill:
+        c.fill = fill
+    if wrap:
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+    return c
+
+
+def _ozet_row_fill(k_cls, d_cls, warn_fill, bad_fill):
+    if d_cls == "Kirmizi" or k_cls == "Kirmizi":
+        return bad_fill
+    if d_cls == "Sari" or k_cls == "Sari":
+        return warn_fill
+    return None
+
+
+def _write_ozet_table(ws, start_row, title, headers, rows, section_fill, warn_fill, bad_fill):
+    """Baslik + tablo; satir sonunda ('__class__', k_cls, d_cls) ile renklendirme."""
+    r = start_row
+    _ozet_set_cell(ws, r, 1, title, bold=True, fill=section_fill)
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=max(len(headers), 2))
+    r += 1
+    for ci, h in enumerate(headers, 1):
+        _ozet_set_cell(ws, r, ci, h, bold=True, fill=section_fill)
+    r += 1
+    for row in rows:
+        k_cls = d_cls = None
+        if row and isinstance(row[-1], tuple) and row[-1][0] == "__class__":
+            k_cls, d_cls = row[-1][1], row[-1][2]
+            row = row[:-1]
+        fill = _ozet_row_fill(k_cls, d_cls, warn_fill, bad_fill) if (k_cls or d_cls) else None
+        for ci, val in enumerate(row, 1):
+            _ozet_set_cell(ws, r, ci, val, fill=fill)
+        r += 1
+    return r + 1
+
+
+def write_ozet_sheet(wb, report):
+    """Excel'in ilk sekmesi: tablo halinde genel bilgi + churn ozeti."""
+    if SUMMARY_SHEET_NAME in wb.sheetnames:
+        del wb[SUMMARY_SHEET_NAME]
+    ws = wb.create_sheet(SUMMARY_SHEET_NAME, 0)
+
+    section_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    warn_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    bad_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    r = 1
+    ws.cell(row=r, column=1, value="Ozet — Veri kalitesi ve churn").font = Font(bold=True, size=14)
+    r += 2
+
+    r = _write_ozet_table(
+        ws,
+        r,
+        "1) Genel bilgi",
+        ["Alan", "Deger"],
+        [
+            ["Oyun", report["game_name"]],
+            ["Ulke", report["country_code"]],
+            ["Tarih araligi", report["date_range"]],
+            ["Max level", report["max_level"]],
+            ["Olusturma", report["generated_at"]],
+            ["Kaynak dosya", len(report["source_files"])],
+        ],
+        section_fill,
+        warn_fill,
+        bad_fill,
+    )
+
+    plat_rows = []
+    for pk in ("Android", "iOS"):
+        p = report["platforms"].get(pk, {})
+        plat_rows.append(
+            [
+                pk,
+                f"L{p.get('recommended_funnel_level', 1)}+",
+                f"L{p.get('recommended_ads_level', 1)}+",
+                len(p.get("churn", {}).get("hotspots", [])),
+            ]
+        )
+    r = _write_ozet_table(
+        ws,
+        r,
+        "2) Platform — guvenilir analiz bandi",
+        ["Platform", "Funnel (K,H)", "ADs (T)", "Churn uyarisi sayisi"],
+        plat_rows,
+        section_fill,
+        warn_fill,
+        bad_fill,
+    )
+
+    r = _write_ozet_table(
+        ws,
+        r,
+        "3) Notlar (segmentasyon / erken level)",
+        ["Aciklama"],
+        [[line] for line in report["global_warnings"][:6]],
+        section_fill,
+        warn_fill,
+        bad_fill,
+    )
+
+    churn_rows = []
+    for pk in ("Android", "iOS"):
+        for item in report["platforms"].get(pk, {}).get("churn", {}).get("hotspots", []):
+            churn_rows.append(
+                [
+                    pk,
+                    item["level"],
+                    item["start"],
+                    item["complete"],
+                    item["complete_rate"] if item["complete_rate"] is not None else "",
+                    item["k_pct"] if item["k_pct"] is not None else "",
+                    item["k_class"],
+                    item["drop1_pct"] if item["drop1_pct"] is not None else "",
+                    item["drop1_class"],
+                    item["fail"],
+                    item["tryagain"],
+                    item["note"],
+                    ("__class__", item["k_class"], item["drop1_class"]),
+                ]
+            )
+    if not churn_rows:
+        churn_rows = [["—", "—", "", "", "", "", "", "", "", "", "", "Uyari yok"]]
+    r = _write_ozet_table(
+        ws,
+        r,
+        "4) Churn — oncelikli leveller (Kirmizi/Sari K veya H)",
+        [
+            "Platform",
+            "Level",
+            "Start",
+            "Complete",
+            "Complete/Start %",
+            "K %",
+            "K durum",
+            "Drop1 %",
+            "H durum",
+            "Fail",
+            "Tryagain",
+            "Not",
+        ],
+        churn_rows,
+        section_fill,
+        warn_fill,
+        bad_fill,
+    )
+
+    band_rows = []
+    for pk in ("Android", "iOS"):
+        for b in report["platforms"].get(pk, {}).get("churn", {}).get("bands", []):
+            band_rows.append(
+                [
+                    pk,
+                    b["name"],
+                    b["range"],
+                    b["avg_complete_rate"] if b["avg_complete_rate"] is not None else "",
+                    b["avg_drop1"] if b["avg_drop1"] is not None else "",
+                    b["red_drop"],
+                    b["yellow_drop"],
+                    b["red_k"],
+                    b["levels_in_band"],
+                ]
+            )
+    if band_rows:
+        r = _write_ozet_table(
+            ws,
+            r,
+            "5) Level banti ozeti",
+            [
+                "Platform",
+                "Bant",
+                "Aralik",
+                "Ort Complete/Start %",
+                "Ort Drop1 %",
+                "Kirmizi H",
+                "Sari H",
+                "Kirmizi K",
+                "Level sayisi",
+            ],
+            band_rows,
+            section_fill,
+            warn_fill,
+            bad_fill,
+        )
+
+    _write_ozet_table(
+        ws,
+        r,
+        "6) Kaynak dosyalar",
+        ["Dosya"],
+        [[fn] for fn in report["source_files"]],
+        section_fill,
+        warn_fill,
+        bad_fill,
+    )
+
+    widths = [14, 8, 10, 10, 14, 8, 10, 10, 10, 8, 10, 28]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    print(f"   OK '{SUMMARY_SHEET_NAME}' sekmesi eklendi (tablo ozeti + churn).")
+
+
+def print_quality_report_console(report):
+    """Konsola kisa ozet."""
+    print("\n--- Ozet ---")
+    print(f"  Oyun: {report['game_name']} | Tarih: {report['date_range']}")
+    for pk in ("Android", "iOS"):
+        p = report["platforms"].get(pk, {})
+        rf = p.get("recommended_funnel_level", p.get("recommended_level", 1))
+        ra = p.get("recommended_ads_level", 1)
+        hot = p.get("churn", {}).get("hotspots", [])
+        top = ", ".join(f"L{x['level']}" for x in hot[:5]) if hot else "yok"
+        print(f"  {pk}: funnel L{rf}+ | ADs L{ra}+ | churn uyarisi: {top}")
+    print("  Detay tablolar: Excel > 'Ozet' sekmesi.\n")
 
 
 def main():
@@ -1155,6 +1812,18 @@ def main():
 
     if "ARPU" in wb.sheetnames and "Av.Rw" in wb.sheetnames:
         apply_arpu_avgrw_level_formulas_and_charts(wb, arpu_chart_max_level)
+
+    quality_report = build_data_quality_report(
+        data_android,
+        data_ios,
+        game_name=detected_game,
+        date_range=date_range,
+        country_code=country_code,
+        max_level=max_level,
+        source_files=files,
+    )
+    write_ozet_sheet(wb, quality_report)
+    print_quality_report_console(quality_report)
 
     # #region agent log
     _agent_debug_log(
