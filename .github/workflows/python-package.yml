@@ -38,3 +38,9 @@ jobs:
     - name: Test with pytest
       run: |
         pytest
+        code=$?
+        if [ $code -eq 5 ]; then
+          echo "No tests collected; skipping pytest failure."
+          exit 0
+        fi
+        exit $code
