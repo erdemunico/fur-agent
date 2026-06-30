@@ -8,7 +8,7 @@ Bu dosya, projede degisiklik yaparken once neyin korunacagini netlestirmek ve
 - GitHub repo: `git@github.com-unico:erdemunico/fur-agent.git`
 - Aktif branch: `funnel_main`
 - `main` ve `funnel_main` GitHub ile senkron.
-- Son ortak commit: `d8480a7`
+- Son ortak commit: `ea30c7f`
 
 ## 2) Kritik Dosya Politikasi
 
@@ -131,7 +131,7 @@ Her is bittiginde bu formati ekle:
   - Yedek kaynak: `veri-*.csv` (Store Name ile ayrim).
 - Dogrulama: `python -m py_compile process_data.py`; ornek CSV ile And/IOS ayri yukleme testi.
 - Risk/Not: Export dosya adinda platform yoksa analytics ekibinden `google_` / `ios_` on eki istenmeli.
-- Commit: (asagidaki 2026-06-30 kaydinda)
+- Commit: `ea30c7f`
 
 ---
 - Tarih: 2026-06-30
@@ -143,4 +143,4 @@ Her is bittiginde bu formati ekle:
   - Eski kopyalar (`Downloads\fur agent`, `.cursor\projects\fur-agent`) kaldirildi.
 - Dogrulama: `git status`, `git push` funnel_main.
 - Risk/Not: Cursor'da yeni klasoru ac; script `SCRIPT_DIR` kullandigi icin kod degisikligi gerekmez.
-- Commit: (bu guncellemeden sonra eklenecek)
+- Commit: `ea30c7f`
