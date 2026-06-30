@@ -8,7 +8,7 @@ Bu dosya, projede degisiklik yaparken once neyin korunacagini netlestirmek ve
 - GitHub repo: `git@github.com-unico:erdemunico/fur-agent.git`
 - Aktif branch: `funnel_main`
 - `main` ve `funnel_main` GitHub ile senkron.
-- Son ortak commit: `ea30c7f`
+- Son ortak commit: `7e09556`
 
 ## 2) Kritik Dosya Politikasi
 
