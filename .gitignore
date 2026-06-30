@@ -9,6 +9,7 @@
 
 # Gelir / veri CSV (yerel exportlar)
 veri-*.csv
+*detailed_level_table*.csv
 
 # Script debug / yerel log
 debug-fb19ec.log

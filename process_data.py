@@ -63,6 +63,17 @@ def _is_output_workbook(basename: str) -> bool:
     return "_otomatik_analiz" in b
 
 
+def _is_revenue_level_table_file(basename: str) -> bool:
+    """Analytics detailed level table (Level + Revenue); funnel verisi degil."""
+    return "detailed_level_table" in str(basename).lower()
+
+
+def _is_revenue_level_table_xlsx(basename: str) -> bool:
+    return _is_revenue_level_table_file(basename) and str(basename).lower().endswith(
+        (".xlsx", ".xls", ".xlsm")
+    )
+
+
 def _is_template_workbook(basename: str) -> bool:
     b = str(basename)
     if b.startswith("Copy of Hole_Pool"):
@@ -141,6 +152,9 @@ def collect_data_xlsx_files(script_dir):
             continue
         if _is_output_workbook(base):
             skipped.append((base, "cikti"))
+            continue
+        if _is_revenue_level_table_file(base):
+            skipped.append((base, "revenue tablosu"))
             continue
         try:
             df_check = pd.read_excel(path, nrows=50, header=None)
@@ -1597,6 +1611,298 @@ def write_ozet_sheet(wb, report):
     print(f"   OK '{SUMMARY_SHEET_NAME}' sekmesi eklendi (tablo ozeti + churn).")
 
 
+def _platform_has_funnel_data(data_by_funnel):
+    for ft in ("Start", "Complete"):
+        df = data_by_funnel.get(ft)
+        if df is not None and not df.empty:
+            return True
+    return False
+
+
+def _find_revenue_value_column(df):
+    """Level tablosunda revenue sutununu bul (Revenue ($), Revenue, vb.)."""
+    for col in df.columns:
+        key = re.sub(r"\s+", " ", str(col).strip().lower())
+        if key in ("revenue ($)", "revenue", "total $", "usd price", "revenue usd"):
+            return col
+        if "revenue" in key and "$" in key:
+            return col
+    return None
+
+
+def _detect_revenue_platform_from_filename(path):
+    """
+    Dosya adindan Google (And) / iOS ayirimi.
+    Ornek: ...google..., ...android..., ...ios..., ...appstore...
+    """
+    base = os.path.basename(path).lower()
+    and_keys = ("google", "android", "playstore", "play_store", "play-store", "_and_")
+    ios_keys = ("ios", "appstore", "app_store", "app-store", "iphone", "_ios_")
+    if any(k in base for k in and_keys):
+        return "and"
+    if any(k in base for k in ios_keys):
+        return "ios"
+    return None
+
+
+def _purchase_platform_display_label(platform_code):
+    if platform_code == "and":
+        return "Google (And)"
+    if platform_code == "ios":
+        return "iOS"
+    return "BELIRSIZ"
+
+
+def _print_purchase_export_naming_requirement(unlabeled_paths=None):
+    """
+    Purchase export dosya adinda platform etiketi yoksa uyari ve analytics ekibi icin metin.
+    """
+    print("\n   *** UYARI: Purchase dosya adinda platform (google/ios) yok ***")
+    print("   Export dosyalari su an yalnizca zaman damgasi ile geliyor; And/IOS ayrimi")
+    print("   dosya adindan veya CSV icinden okunamiyor.")
+    print("")
+    print("   Cozum (tercih edilen): Export/indirme tarafinda dosya adina platform eklensin:")
+    print("     google_detailed_level_table_<tarih>.csv")
+    print("     ios_detailed_level_table_<tarih>.csv")
+    print("")
+    print("   Kabul edilen anahtar kelimeler (dosya adinda, buyuk/kucuk harf fark etmez):")
+    print("     Google/Android -> And    |    iOS/AppStore -> IOS")
+    if unlabeled_paths:
+        print("")
+        print("   Etiketsiz dosyalar:")
+        for p in unlabeled_paths:
+            print(f"     - {os.path.basename(p)}")
+    print("")
+    print("   --- Analytics / export ekibine iletilebilecek metin ---")
+    print(
+        "   detailed_level_table purchase export'larinda dosya adina platform eklenmeli.\n"
+        "   Ornek: google_detailed_level_table_2026-06-30.csv ve\n"
+        "          ios_detailed_level_table_2026-06-30.csv\n"
+        "   CSV icinde Store/OS kolonu olmadigi icin dosya adi zorunlu ayrim kaynagi."
+    )
+    print("   --------------------------------------------------------\n")
+
+
+def _warn_unlabeled_purchase_files(unlabeled_paths, and_parts, ios_parts):
+    if not unlabeled_paths:
+        return
+    _print_purchase_export_naming_requirement(unlabeled_paths)
+    if and_parts or ios_parts:
+        print(
+            "   Not: Etiketsiz dosyalar atlandi (etiketli dosyalar kullanildi).\n"
+            "        Lutfen etiketsiz exportlari yeniden adlandirin veya analytics ekibinden\n"
+            "        platformlu dosya adi isteyin.\n"
+        )
+
+
+def _read_revenue_level_table(path):
+    """
+    detailed_level_table csv/xlsx: Level + Revenue ($) -> Level, Total $.
+    Level sirasi duzensiz olabilir; level'a gore toplanir ve siralanir.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        df = pd.read_csv(path)
+    else:
+        df = pd.read_excel(path)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    level_col = None
+    for col in df.columns:
+        if str(col).strip().lower() == "level":
+            level_col = col
+            break
+    if level_col is None:
+        return pd.DataFrame()
+    rev_col = _find_revenue_value_column(df)
+    if rev_col is None:
+        return pd.DataFrame()
+    sub = df[[level_col, rev_col]].copy()
+    sub.columns = ["Level", "Total $"]
+    sub["Level"] = pd.to_numeric(sub["Level"], errors="coerce")
+    sub["Total $"] = pd.to_numeric(sub["Total $"], errors="coerce").fillna(0)
+    sub = sub.dropna(subset=["Level"])
+    sub["Level"] = sub["Level"].astype(int)
+    out = sub.groupby("Level", as_index=False)["Total $"].sum()
+    return out.sort_values("Level").reset_index(drop=True)
+
+
+def _prompt_revenue_file_platforms(unlabeled_paths):
+    """Dosya adinda platform yoksa kullaniciya sor (Google=And, diger=IOS)."""
+    if len(unlabeled_paths) != 2:
+        return {}
+    _print_purchase_export_naming_requirement(unlabeled_paths)
+    print("   Simdilik hangi dosyanin Google oldugunu secin.")
+    print("   (Bir sonraki analiz icin dosyalari google_/ios_ ile yeniden adlandirin.)\n")
+    for i, p in enumerate(unlabeled_paths, 1):
+        print(f"     {i}) {os.path.basename(p)}")
+    while True:
+        try:
+            raw = input(
+                "   Google (And) purchase hangi dosya? (1 veya 2; Enter=1) : "
+            ).strip()
+            if not raw:
+                idx_and = 0
+            else:
+                idx_and = int(raw) - 1
+            if idx_and in (0, 1):
+                idx_ios = 1 - idx_and
+                return {
+                    "and": unlabeled_paths[idx_and],
+                    "ios": unlabeled_paths[idx_ios],
+                }
+        except (ValueError, EOFError):
+            return {
+                "and": unlabeled_paths[0],
+                "ios": unlabeled_paths[1],
+            }
+        print("   1 veya 2 girin.")
+
+
+def _merge_revenue_parts(parts):
+    if not parts:
+        return pd.DataFrame()
+    merged = pd.concat(parts, ignore_index=True)
+    merged = merged.groupby("Level", as_index=False)["Total $"].sum()
+    return merged.sort_values("Level").reset_index(drop=True)
+
+
+def _collect_revenue_level_table_paths(script_dir):
+    paths = []
+    for pattern in ("*detailed_level_table*.csv", "*detailed_level_table*.xlsx"):
+        paths.extend(glob.glob(os.path.join(script_dir, pattern)))
+    paths = [
+        p
+        for p in paths
+        if not _is_output_workbook(os.path.basename(p))
+        and not _is_template_workbook(os.path.basename(p))
+    ]
+    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return paths
+
+
+def _load_detailed_level_table_revenue(script_dir, data_android, data_ios):
+    """Google / iOS ayri detailed_level_table dosyalarini And/IOS Total $ olarak yukler."""
+    paths = _collect_revenue_level_table_paths(script_dir)
+    if not paths:
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    print("   Purchase dosyalari:")
+    for p in paths:
+        plat = _detect_revenue_platform_from_filename(p)
+        print(f"     - {os.path.basename(p)}  ->  {_purchase_platform_display_label(plat)}")
+
+    and_parts = []
+    ios_parts = []
+    unlabeled = []
+
+    for p in paths:
+        plat = _detect_revenue_platform_from_filename(p)
+        part = _read_revenue_level_table(p)
+        if part.empty:
+            continue
+        if plat == "and":
+            and_parts.append(part)
+        elif plat == "ios":
+            ios_parts.append(part)
+        else:
+            unlabeled.append(p)
+
+    if unlabeled and not and_parts and not ios_parts and len(unlabeled) == 1:
+        _print_purchase_export_naming_requirement(unlabeled)
+        merged = _read_revenue_level_table(unlabeled[0])
+        has_and = _platform_has_funnel_data(data_android)
+        has_ios = _platform_has_funnel_data(data_ios)
+        src = os.path.basename(unlabeled[0]) + " (platform etiketi yok; funnel'a gore)"
+        return (
+            merged.copy() if has_and else pd.DataFrame(),
+            merged.copy() if has_ios else pd.DataFrame(),
+            src,
+        )
+
+    if unlabeled and not and_parts and not ios_parts and len(unlabeled) != 2:
+        _print_purchase_export_naming_requirement(unlabeled)
+        print(
+            f"   HATA: {len(unlabeled)} etiketsiz purchase dosyasi var; otomatik platform ayrimi yapilamadi.\n"
+            "         Dosyalari google_/ios_ ile yeniden adlandirin veya analytics export adini duzeltsin.\n"
+        )
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    if len(unlabeled) == 2 and not and_parts and not ios_parts:
+        assigned = _prompt_revenue_file_platforms(unlabeled)
+        if assigned.get("and"):
+            and_parts.append(_read_revenue_level_table(assigned["and"]))
+        if assigned.get("ios"):
+            ios_parts.append(_read_revenue_level_table(assigned["ios"]))
+        src = (
+            f"And={os.path.basename(assigned['and'])}; "
+            f"IOS={os.path.basename(assigned['ios'])}"
+        )
+        return _merge_revenue_parts(and_parts), _merge_revenue_parts(ios_parts), src
+
+    if unlabeled:
+        _warn_unlabeled_purchase_files(unlabeled, and_parts, ios_parts)
+
+    and_df = _merge_revenue_parts(and_parts)
+    ios_df = _merge_revenue_parts(ios_parts)
+
+    if and_df.empty and ios_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    names = []
+    if and_parts:
+        names.append("And")
+    if ios_parts:
+        names.append("IOS")
+    src = "detailed_level_table (" + ", ".join(names) + ")"
+    return and_df, ios_df, src
+
+
+def _read_revenue_level_table_xlsx(path):
+    """Geriye uyumluluk."""
+    return _read_revenue_level_table(path)
+
+
+def _load_revenue_from_csv(script_dir):
+    """Eski akis: veri-*.csv (Store Name ile And/IOS ayrimi)."""
+    csv_files = glob.glob(os.path.join(script_dir, "veri-*.csv"))
+    csv_list = []
+    for cf in csv_files:
+        try:
+            cf_df = pd.read_csv(cf)
+            if all(k in cf_df.columns for k in ["Level", "USD Price", "Store Name"]):
+                csv_list.append(cf_df)
+        except Exception:
+            pass
+    if not csv_list:
+        return pd.DataFrame(), pd.DataFrame(), ""
+    all_csv = pd.concat(csv_list, ignore_index=True)
+    all_csv["USD Price"] = pd.to_numeric(all_csv["USD Price"], errors="coerce").fillna(0)
+    all_csv["Level"] = pd.to_numeric(all_csv["Level"], errors="coerce").dropna().astype(int)
+    gu = all_csv[all_csv["Store Name"].astype(str).str.contains("Google", case=False, na=False)]
+    csv_and = gu.groupby("Level")["USD Price"].sum().reset_index().rename(columns={"USD Price": "Total $"})
+    ap = all_csv[all_csv["Store Name"].astype(str).str.contains("AppStore", case=False, na=False)]
+    csv_ios = ap.groupby("Level")["USD Price"].sum().reset_index().rename(columns={"USD Price": "Total $"})
+    names = ", ".join(os.path.basename(p) for p in csv_files[:3])
+    if len(csv_files) > 3:
+        names += f" (+{len(csv_files) - 3})"
+    return csv_and, csv_ios, f"veri-*.csv ({names})"
+
+
+def load_purchase_revenue(script_dir, data_android, data_ios):
+    """
+    And/IOS N (Total $) sutunu icin level bazli gelir.
+    Oncelik: *detailed_level_table*.csv / *.xlsx (Revenue ($); Google/IOS ayri dosya).
+    Yedek: veri-*.csv (Store Name ile And/IOS ayrimi).
+    """
+    and_df, ios_df, src = _load_detailed_level_table_revenue(
+        script_dir, data_android, data_ios
+    )
+    if src:
+        return and_df, ios_df, src
+    return _load_revenue_from_csv(script_dir)
+
+
 def print_quality_report_console(report):
     """Konsola kisa ozet."""
     print("\n--- Ozet ---")
@@ -1682,30 +1988,15 @@ def main():
     for ftype in list(data_ios.keys()):
         data_ios[ftype]     = safe_concat(data_ios[ftype])
 
-    # 3. In-App Purchase USD verileri (CSV)
-    print("3. CSV Gelir verileri okunuyor...")
-    csv_and_usd = pd.DataFrame()
-    csv_ios_usd = pd.DataFrame()
-    csv_files = glob.glob(os.path.join(SCRIPT_DIR, "veri-*.csv"))
-    csv_list = []
-    for cf in csv_files:
-        try:
-            cf_df = pd.read_csv(cf)
-            if all(k in cf_df.columns for k in ['Level', 'USD Price', 'Store Name']):
-                csv_list.append(cf_df)
-        except Exception: pass
-
-    if csv_list:
-        all_csv = pd.concat(csv_list, ignore_index=True)
-        all_csv['USD Price'] = pd.to_numeric(all_csv['USD Price'], errors='coerce').fillna(0)
-        all_csv['Level']     = pd.to_numeric(all_csv['Level'], errors='coerce').dropna().astype(int)
-        
-        gu = all_csv[all_csv['Store Name'].astype(str).str.contains('Google', case=False, na=False)]
-        csv_and_usd = gu.groupby('Level')['USD Price'].sum().reset_index().rename(columns={'USD Price': 'Total $'})
-        
-        ap = all_csv[all_csv['Store Name'].astype(str).str.contains('AppStore', case=False, na=False)]
-        csv_ios_usd = ap.groupby('Level')['USD Price'].sum().reset_index().rename(columns={'USD Price': 'Total $'})
-        print(f"   OK Gelir verileri okundu.")
+    # 3. Gelir verileri (oncelik: detailed_level_table xlsx, yedek: veri-*.csv)
+    print("3. Gelir (revenue) verileri okunuyor...")
+    csv_and_usd, csv_ios_usd, revenue_src = load_purchase_revenue(
+        SCRIPT_DIR, data_android, data_ios
+    )
+    if revenue_src:
+        print(f"   OK Gelir kaynagi: {revenue_src}")
+    else:
+        print("   Bilgi: Gelir dosyasi bulunamadi (detailed_level_table csv/xlsx veya veri-*.csv).")
 
     # 4. Yazma Islemi
     print("4. Sablona yaziliyor...")
