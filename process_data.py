@@ -18,6 +18,31 @@ from copy import deepcopy
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _configure_stdout_utf8():
+    """Windows terminalinde emoji/unicode dosya adlarini yazdirabilmek icin."""
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def _safe_console_text(text):
+    s = str(text)
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        s.encode(enc)
+        return s
+    except (UnicodeEncodeError, LookupError):
+        return s.encode(enc, errors="replace").decode(enc, errors="replace")
+
+
 # Calisma kitabi sablonu (SCRIPT_DIR'de tam bu dosya adi; Git'te izlenir)
 WORKBOOK_TEMPLATE_XLSX = (
     "Hole_Pool_Otomatik_Analiz_v1_US_20260325-20260331_20260401_212238.xlsx"
@@ -115,7 +140,7 @@ def _extract_game_name_from_metadata(df_check):
 
 
 def _xlsx_rows_look_like_data(df_check) -> bool:
-    """# hole-pool etiketi veya Free form tarzi (OS + Level + funnel) yapi."""
+    """# hole-pool etiketi veya Free form tarzi (OS/Platform veya Level+funnel) yapi."""
     if df_check is None or df_check.empty:
         return False
     # 1) Once metaveri kontrolu (oyun etiketi)
@@ -127,9 +152,17 @@ def _xlsx_rows_look_like_data(df_check) -> bool:
     # 2) Metaveri yoksa free-form kolon yapisi
     head = df_check.head(min(15, len(df_check)))
     blob = " ".join(head.fillna("").astype(str).values.flatten()).lower()
-    if "operating system" not in blob or "level" not in blob:
+    if "level" not in blob:
         return False
-    return any(k in blob for k in ("start", "complete", "fail", "tryagain", "ads"))
+    if not any(k in blob for k in ("start", "complete", "fail", "tryagain", "ads")):
+        return False
+    if "operating system" in blob or "platform" in blob:
+        return True
+    # Platform yok: App version / network kirilimli export
+    return any(
+        k in blob
+        for k in ("app version", "user_network", "user network")
+    )
 
 
 def collect_data_xlsx_files(script_dir):
@@ -162,7 +195,7 @@ def collect_data_xlsx_files(script_dir):
             skipped.append((base, f"okunamadi: {e!s}"))
             continue
         if not _xlsx_rows_look_like_data(df_check):
-            skipped.append((base, "veri yapisi (hole-pool / OS+Level) yok"))
+            skipped.append((base, "veri yapisi (oyun etiketi / Level+funnel) yok"))
             continue
         files.append(path)
         game_name = _extract_game_name_from_metadata(df_check)
@@ -273,6 +306,37 @@ def get_arpu_chart_max_level_from_user(main_max_level):
             return main_max_level
 
 
+def get_unspecified_platform_target_from_user(file_names):
+    """
+    Export'ta Platform/OS yoksa And / IOS / her ikisi secimi.
+    Enter veya EOF: And (varsayilan).
+    """
+    names = [str(n) for n in (file_names or []) if n]
+    print(
+        f"   UYARI: {len(names)} dosyada Platform (Android/iOS) yok "
+        "(App version / network kirilimi)."
+    )
+    if names:
+        shown = names[:8]
+        extra = f" (+{len(names) - 8})" if len(names) > 8 else ""
+        print("          " + ", ".join(shown) + extra)
+    prompt = (
+        "   Veri nereye yazilsin? And / IOS / both  (Enter = And) : "
+    )
+    while True:
+        try:
+            raw = input(prompt).strip().lower()
+        except EOFError:
+            return "and"
+        if not raw or raw in ("and", "android", "1"):
+            return "and"
+        if raw in ("ios", "i", "2"):
+            return "ios"
+        if raw in ("both", "her ikisi", "heriki", "all", "3"):
+            return "both"
+        print("   Gecerli secim: And, IOS veya both.")
+
+
 def _base_col_name(col_name):
     if "_" in col_name and str(col_name).split("_")[-1].isdigit():
         return col_name.split("_")[0]
@@ -291,6 +355,20 @@ _COIN_ALIASES = frozenset(
 _USER_COUNT_CANON = "user_count"
 _USER_COUNT_ALIASES = frozenset(
     {"active_users", "total_users", "activeusers", "totalusers"}
+)
+
+# Platform disi kirilim kolonlari (metrik degil; Level bazinda toplanir)
+_DIMENSION_COL_CANON = frozenset(
+    {
+        "event_name",
+        "eventname",
+        "app_version",
+        "appversion",
+        "user_network",
+        "usernetwork",
+        "network",
+        "segment",
+    }
 )
 
 # Funnel tipi tespiti (ust satir / Segment); uzun eslesmeler once
@@ -412,79 +490,172 @@ def detect_funnel_type(df_raw):
     return "Unknown"
 
 
+def _is_os_header_label(value):
+    """Analytics export: 'Operating system' (ADs) veya 'Platform' (Start/Complete vb.)."""
+    return str(value).strip().casefold() in ("operating system", "platform")
+
+
+def _platform_column_name(columns):
+    for name in ("Operating system", "Platform"):
+        if name in columns:
+            return name
+    return None
+
+
+def _header_cell_name(value):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def _unique_header_names(names):
+    seen = {}
+    unique = []
+    for c in names:
+        if c in seen:
+            seen[c] += 1
+            unique.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 0
+            unique.append(c)
+    return unique
+
+
+def _is_blank_header(name):
+    s = str(name).strip()
+    if not s:
+        return True
+    base = str(_base_col_name(s)).strip()
+    return not base
+
+
+def _is_dimension_column(name):
+    s = str(name)
+    k = _norm_metric_token(_base_col_name(s))
+    k2 = _norm_metric_token(s)
+    return k in _DIMENSION_COL_CANON or k2 in _DIMENSION_COL_CANON
+
+
+def _drop_non_metric_columns(df):
+    """Event name / App version / user_network ve bos basliklari at."""
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    drop = [
+        c
+        for c in df.columns
+        if c != "Level" and (_is_blank_header(c) or _is_dimension_column(c))
+    ]
+    if not drop:
+        return df
+    return df.drop(columns=drop, errors="ignore")
+
+
+def _keep_numeric_levels(df):
+    if df is None or df.empty or "Level" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    lvl = pd.to_numeric(out["Level"], errors="coerce")
+    return out.loc[lvl.notna()].reset_index(drop=True)
+
+
+def _dataframe_from_header_row(df_raw, header_idx):
+    header_vals = [_header_cell_name(x) for x in df_raw.iloc[header_idx].tolist()]
+    unique_cols = _unique_header_names(header_vals)
+    df_flat = df_raw.iloc[header_idx + 1 :].copy()
+    df_flat.columns = unique_cols
+    if "Level" not in df_flat.columns:
+        return pd.DataFrame()
+    return _keep_numeric_levels(df_flat)
+
+
 def read_platform_data(f):
     """
     Excel dosyasini okur, Android ve iOS verilerini ayri DataFrame olarak dondurur.
-    Doner: (funnel_type, df_android, df_ios)
+    Platform yoksa (App version / network kirilimi) tum satirlar df_android'da,
+    has_platform=False doner.
+    Doner: (funnel_type, df_android, df_ios, has_platform)
     """
     df_raw = pd.read_excel(f, header=None)
     funnel_type = detect_funnel_type(df_raw)
+    empty = (funnel_type, pd.DataFrame(), pd.DataFrame(), False)
 
     os_row_idx = None
     level_row_idx = None
     for idx in range(min(15, len(df_raw))):
         row = df_raw.iloc[idx]
         for cell in row:
-            if str(cell).strip() == 'Operating system' and os_row_idx is None:
+            if _is_os_header_label(cell) and os_row_idx is None:
                 os_row_idx = idx
-            if str(cell).strip() == 'Level' and level_row_idx is None:
+            if _header_cell_name(cell) == "Level" and level_row_idx is None:
                 level_row_idx = idx
 
-    if os_row_idx is None or level_row_idx is None:
-        print(f"   UYARI: '{f}' -> 'Operating system' veya 'Level' bulunamadi, atlaniyor.")
-        return funnel_type, pd.DataFrame(), pd.DataFrame()
+    if level_row_idx is None:
+        print(f"   UYARI: '{f}' -> 'Level' bulunamadi, atlaniyor.")
+        return empty
 
-    os_row_vals  = df_raw.iloc[os_row_idx].fillna('').astype(str).str.strip().tolist()
-    level_row_vals = [str(x).strip() for x in df_raw.iloc[level_row_idx].tolist()]
+    if os_row_idx is None:
+        df_flat = _drop_non_metric_columns(
+            _dataframe_from_header_row(df_raw, level_row_idx)
+        )
+        print(
+            f"   Bilgi: '{os.path.basename(f)}' -> Platform yok; "
+            "App version / network satirlari Level bazinda toplanacak."
+        )
+        return funnel_type, df_flat, pd.DataFrame(), False
+
+    os_row_vals = df_raw.iloc[os_row_idx].fillna("").astype(str).str.strip().tolist()
+    level_row_vals = [_header_cell_name(x) for x in df_raw.iloc[level_row_idx].tolist()]
 
     if level_row_idx == os_row_idx:
-        df_flat = df_raw.iloc[level_row_idx + 1:].copy()
-        seen = {}
-        unique_cols = []
-        for c in level_row_vals:
-            if c in seen:
-                seen[c] += 1
-                unique_cols.append(f"{c}_{seen[c]}")
-            else:
-                seen[c] = 0
-                unique_cols.append(c)
-        df_flat.columns = unique_cols
-        df_flat = df_flat.dropna(subset=['Level'])
+        df_flat = _dataframe_from_header_row(df_raw, level_row_idx)
+        os_col = _platform_column_name(df_flat.columns)
+        if os_col is None:
+            df_flat = _drop_non_metric_columns(df_flat)
+            print(
+                f"   Bilgi: '{os.path.basename(f)}' -> Platform sutunu yok; "
+                "Level bazinda toplanacak."
+            )
+            return funnel_type, df_flat, pd.DataFrame(), False
 
-        df_and  = df_flat[df_flat['Operating system'].astype(str).str.contains('Android', case=False, na=False)].copy()
-        df_ios  = df_flat[df_flat['Operating system'].astype(str).str.contains('iOS',     case=False, na=False)].copy()
-        
-        df_and  = df_and.drop(columns=['Operating system'], errors='ignore').reset_index(drop=True)
-        df_ios  = df_ios.drop(columns=['Operating system'], errors='ignore').reset_index(drop=True)
-        return funnel_type, df_and, df_ios
+        df_and = df_flat[
+            df_flat[os_col].astype(str).str.contains("Android", case=False, na=False)
+        ].copy()
+        df_ios = df_flat[
+            df_flat[os_col].astype(str).str.contains("iOS", case=False, na=False)
+        ].copy()
 
-    else:
-        level_col_idx = next((i for i, v in enumerate(level_row_vals) if v == 'Level'), None)
-        if level_col_idx is None:
-            print(f"   UYARI: '{f}' -> Level sutun indeksi bulunamadi.")
-            return funnel_type, pd.DataFrame(), pd.DataFrame()
+        df_and = _drop_non_metric_columns(
+            df_and.drop(columns=[os_col], errors="ignore").reset_index(drop=True)
+        )
+        df_ios = _drop_non_metric_columns(
+            df_ios.drop(columns=[os_col], errors="ignore").reset_index(drop=True)
+        )
+        return funnel_type, df_and, df_ios, True
 
-        and_indices = [i for i, v in enumerate(os_row_vals) if v == 'Android']
-        ios_indices = [i for i, v in enumerate(os_row_vals) if v == 'iOS']
-        data_start  = level_row_idx + 1
+    level_col_idx = next((i for i, v in enumerate(level_row_vals) if v == "Level"), None)
+    if level_col_idx is None:
+        print(f"   UYARI: '{f}' -> Level sutun indeksi bulunamadi.")
+        return empty
 
-        def extract(col_indices):
-            cols = [level_col_idx] + col_indices
-            sub  = df_raw.iloc[data_start:, cols].copy()
-            raw_names = [level_row_vals[level_col_idx]] + [level_row_vals[i] for i in col_indices]
-            seen = {}
-            unique_names = []
-            for n in raw_names:
-                if n in seen:
-                    seen[n] += 1
-                    unique_names.append(f"{n}_{seen[n]}")
-                else:
-                    seen[n] = 0
-                    unique_names.append(n)
-            sub.columns = unique_names
-            return sub.dropna(subset=['Level']).reset_index(drop=True)
+    and_indices = [i for i, v in enumerate(os_row_vals) if v == "Android"]
+    ios_indices = [i for i, v in enumerate(os_row_vals) if v == "iOS"]
+    data_start = level_row_idx + 1
 
-        return funnel_type, extract(and_indices), extract(ios_indices)
+    def extract(col_indices):
+        cols = [level_col_idx] + col_indices
+        sub = df_raw.iloc[data_start:, cols].copy()
+        raw_names = [level_row_vals[level_col_idx]] + [
+            level_row_vals[i] for i in col_indices
+        ]
+        sub.columns = _unique_header_names(raw_names)
+        return _drop_non_metric_columns(_keep_numeric_levels(sub))
+
+    return funnel_type, extract(and_indices), extract(ios_indices), True
 
 
 def safe_concat(df_list):
@@ -515,28 +686,30 @@ def safe_concat(df_list):
 
 def format_and_fill_levels(df_sub, max_level):
     """Level bazinda topla, max_level'a kadar eksiksiz tablo dondur."""
-    if df_sub.empty or 'Level' not in df_sub.columns:
-        return pd.DataFrame({'Level': range(1, max_level + 1)})
+    if df_sub.empty or "Level" not in df_sub.columns:
+        return pd.DataFrame({"Level": range(1, max_level + 1)})
 
-    df_sub = df_sub.copy()
-    df_sub['Level'] = pd.to_numeric(df_sub['Level'], errors='coerce')
-    df_sub = df_sub.dropna(subset=['Level']).copy()
-    df_sub['Level'] = df_sub['Level'].astype(int)
-    df_sub = df_sub[df_sub['Level'] <= max_level]
-    
+    df_sub = _drop_non_metric_columns(df_sub.copy())
+    df_sub["Level"] = pd.to_numeric(df_sub["Level"], errors="coerce")
+    df_sub = df_sub.dropna(subset=["Level"]).copy()
+    df_sub["Level"] = df_sub["Level"].astype(int)
+    df_sub = df_sub[df_sub["Level"] <= max_level]
+
     for col in df_sub.columns:
-        if col != 'Level':
-            df_sub[col] = pd.to_numeric(df_sub[col], errors='coerce').fillna(0)
+        if col != "Level":
+            df_sub[col] = pd.to_numeric(df_sub[col], errors="coerce").fillna(0)
 
-    numeric_cols = df_sub.select_dtypes(include='number').columns.tolist()
-    if 'Level' in numeric_cols:
-        numeric_cols.remove('Level')
+    numeric_cols = df_sub.select_dtypes(include="number").columns.tolist()
+    if "Level" in numeric_cols:
+        numeric_cols.remove("Level")
 
-    grouped = df_sub.groupby('Level')[numeric_cols].sum().reset_index()
-    grouped = grouped.sort_values(by='Level')
+    all_levels = pd.DataFrame({"Level": range(1, max_level + 1)})
+    if not numeric_cols:
+        return all_levels
 
-    all_levels = pd.DataFrame({'Level': range(1, max_level + 1)})
-    merged = pd.merge(all_levels, grouped, on='Level', how='left')
+    grouped = df_sub.groupby("Level")[numeric_cols].sum().reset_index()
+    grouped = grouped.sort_values(by="Level")
+    merged = pd.merge(all_levels, grouped, on="Level", how="left")
     merged.fillna(0, inplace=True)
     return merged
 
@@ -605,6 +778,54 @@ def _find_column_by_header_keywords(ws, keywords, rows=(1, 2, 3), skip_cols=None
     return None
 
 
+def _header_cell_display(value, fallback=""):
+    if value is None:
+        return fallback
+    s = str(value).strip()
+    return s if s else fallback
+
+
+# And/IOS churn metrikleri: H (8) ve K (11) — satir 2 alt basliklari
+_AND_IOS_K_COL = 11
+_AND_IOS_H_COL = 8
+_AND_IOS_METRIC_HEADER_ROW = 2
+
+
+def _extract_and_ios_metric_labels(wb):
+    """And/IOS 2. satirdaki gercek sutun adlarini okur (or. % ve Drop 1)."""
+    ws = _worksheet_by_name(wb, "And") or _worksheet_by_name(wb, "IOS")
+    if ws is None:
+        return {"k_label": "%", "h_label": "Drop 1"}
+    r = _AND_IOS_METRIC_HEADER_ROW
+    return {
+        "k_label": _header_cell_display(
+            ws.cell(row=r, column=_AND_IOS_K_COL).value, "%"
+        ),
+        "h_label": _header_cell_display(
+            ws.cell(row=r, column=_AND_IOS_H_COL).value, "Drop 1"
+        ),
+    }
+
+
+def _report_metric_labels(report):
+    labels = report.get("metric_labels") or {}
+    return {
+        "k_label": labels.get("k_label") or "%",
+        "h_label": labels.get("h_label") or "Drop 1",
+    }
+
+
+def _format_churn_hotspot_label(item, metric_labels=None):
+    """Ornek: L10 (%=Yesil, Drop 1=Sari) — And/IOS satir 2 basliklariyla."""
+    labels = metric_labels or {}
+    k_name = labels.get("k_label") or "%"
+    h_name = labels.get("h_label") or "Drop 1"
+    return (
+        f"L{item['level']} "
+        f"({k_name}={item.get('k_class', '')}, {h_name}={item.get('drop1_class', '')})"
+    )
+
+
 def write_row1_owned_avg_coin_averages(wb, sheet_name, max_level):
     """
     And / IOS: 1. satira Owned Coin ve Avg. Coin sutunlarinin
@@ -645,16 +866,27 @@ def write_row1_owned_avg_coin_averages(wb, sheet_name, max_level):
     )
 
 
+def _resolve_detected_game_name(game_dict):
+    """Metaveriden en sik gecen oyun adini sec."""
+    game_names = [g for g in (game_dict or {}).values() if g]
+    if not game_names:
+        return None
+    game_counter = {}
+    for g in game_names:
+        game_counter[g] = game_counter.get(g, 0) + 1
+    return sorted(game_counter.items(), key=lambda x: (-x[1], x[0]))[0][0]
+
+
 def find_arpu_reference_workbook(script_dir, output_path=None):
     """
-    Oncelik: ARPU_CHART_REFERENCE_XLSX. Yoksa en yeni Hole_Pool_Otomatik_Analiz*.xlsx
+    Oncelik: ARPU_CHART_REFERENCE_XLSX. Yoksa en yeni *_Otomatik_Analiz*.xlsx
     (cikti dosyasi ve sablon haric).
     """
     out_abs = os.path.abspath(output_path) if output_path else None
     pref = os.path.join(script_dir, ARPU_CHART_REFERENCE_XLSX)
     if os.path.isfile(pref) and (out_abs is None or os.path.abspath(pref) != out_abs):
         return pref
-    paths = glob.glob(os.path.join(script_dir, "Hole_Pool_Otomatik_Analiz*.xlsx"))
+    paths = glob.glob(os.path.join(script_dir, "*_Otomatik_Analiz*.xlsx"))
     paths = [
         p
         for p in paths
@@ -979,15 +1211,22 @@ def write_tab_data(wb, sheet_name, data_by_funnel, col_map, max_level, revenue_d
                 ws.cell(row=t_row, column=c_idx).value = shifted_f
 
     # 5b. K (%) sütunu:
-    # - Level 1..100: şablondaki formül yazılır
+    # - Level 1 (satir 3): BOŞ — Start user property sebebiyle L1 temiz gelmiyor;
+    #   C3 bazli hesap yaniltici olur.
+    # - Level 2..100: K(n) = 100-(((C(n-1)-C(n))/C(n-1))*100)
+    #   Yani her satir bir onceki level'in Complete'ini baz alir.
     # - Level >100 : boş bırakılır (gösterilmez)
-    # Formül: L1 Complete (satır 3, C3) ile bir alt satırdaki C sütunu arasındaki oran; yüzde cinsinden.
     if sheet_name in ('And', 'IOS'):
+        l1_row = level_rows.get(1, 3)  # C3 = L1 Complete satiri
         for level in range(1, max_level + 1):
             t_row = level_rows[level]
-            if level <= 100:
+            if level == 1:
+                # K3 bos; L1 baz satiri, kendisiyle karsilastirma anlamsiz
+                ws.cell(row=t_row, column=11).value = None
+            elif level <= 100:
+                # K(n) = 100 - ((C3 - C(n)) / C3 * 100)  — hep L1 Complete baz
                 ws.cell(row=t_row, column=11).value = (
-                    f'=100-(((C3-C{t_row + 1})/C3)*100)'
+                    f'=100-(((C{l1_row}-C{t_row})/C{l1_row})*100)'
                 )
             else:
                 ws.cell(row=t_row, column=11).value = None
@@ -1210,12 +1449,18 @@ def _k_yellow_threshold(level):
 
 
 def _excel_k_pct(complete, level):
-    """And/IOS K (%) sutunu ile ayni mantik: L1 Complete vs (level+1) Complete."""
+    """
+    And/IOS K (%) sutunu ile ayni mantik: hep L1 Complete (C3) baz.
+    K(n) = 100 - ((C1 - C(n)) / C1 * 100)
+    Level 1 icin None donulur (K3 bos).
+    """
+    if level <= 1:
+        return None
     c1 = complete.get(1, 0.0)
-    c_next = complete.get(level + 1, 0.0)
+    c_curr = complete.get(level, 0.0)
     if c1 <= 0:
         return None
-    return 100.0 - ((c1 - c_next) / c1 * 100.0)
+    return 100.0 - ((c1 - c_curr) / c1 * 100.0)
 
 
 def _drop1_pct(complete, level):
@@ -1306,8 +1551,8 @@ def _build_platform_churn(series, max_level, reliable_from):
 
     hotspots = sorted(
         [r for r in rows if r["priority"] > 0],
-        key=lambda x: (-x["priority"], -(x["drop1_pct"] or 0), -(x["k_pct"] or 0)),
-    )[:30]
+        key=lambda x: x["level"],
+    )[:50]
 
     band_defs = (
         ("Erken", lo, min(30, hi)),
@@ -1339,6 +1584,243 @@ def _build_platform_churn(series, max_level, reliable_from):
     return {"hotspots": hotspots, "bands": bands}
 
 
+def _fmt_int(v):
+    try:
+        return f"{int(round(float(v))):,}".replace(",", ".")
+    except Exception:
+        return "0"
+
+
+def _sum_series_values(level_map):
+    if not isinstance(level_map, dict):
+        return 0.0
+    return float(sum(v for v in level_map.values() if pd.notna(v)))
+
+
+def _build_revenue_summary(revenue_android_df, revenue_ios_df, revenue_source):
+    def _sum_rev(df):
+        if df is None or df.empty or "Total $" not in df.columns:
+            return 0.0
+        s = pd.to_numeric(df["Total $"], errors="coerce").fillna(0).sum()
+        return float(s)
+
+    and_total = _sum_rev(revenue_android_df)
+    ios_total = _sum_rev(revenue_ios_df)
+    total = and_total + ios_total
+    if total <= 0:
+        return {}
+    and_share = (and_total / total * 100.0) if total > 0 else 0.0
+    ios_share = (ios_total / total * 100.0) if total > 0 else 0.0
+    return {
+        "source": revenue_source or "",
+        "android_total": and_total,
+        "ios_total": ios_total,
+        "total": total,
+        "android_share_pct": and_share,
+        "ios_share_pct": ios_share,
+    }
+
+
+def _build_auto_insights(report):
+    """
+    Esnek insight listesi:
+    - Sadece raporda gercekten bulunan verilerden cikarim yazar.
+    - Veri yoksa ilgili satir eklenmez (hallucination yok).
+    """
+    insights = []
+    game = report.get("game_name", "Oyun")
+    date_range = report.get("date_range", "-")
+    max_level = report.get("max_level", 0)
+    insights.append(f"{game} | {date_range} donemi, analiz limiti L{max_level}.")
+
+    rev = report.get("revenue_summary") or {}
+    if rev:
+        insights.append(
+            "Purchase revenue toplam $"
+            f"{rev.get('total', 0):,.0f} "
+            f"(Android ${rev.get('android_total', 0):,.0f}, iOS ${rev.get('ios_total', 0):,.0f}; "
+            f"pay: %{rev.get('android_share_pct', 0):.1f} / %{rev.get('ios_share_pct', 0):.1f})."
+        )
+        if rev.get("source"):
+            insights.append(f"Gelir kaynagi: {rev['source']}.")
+
+    for pk in ("Android", "iOS"):
+        p = report["platforms"].get(pk, {})
+        series = p.get("series", {})
+        start_l1 = float(series.get("Start", {}).get(1, 0.0))
+        complete_l1 = float(series.get("Complete", {}).get(1, 0.0))
+        fail_total = _sum_series_values(series.get("Fail", {}))
+        try_total = _sum_series_values(series.get("Tryagain", {}))
+        ads_total = _sum_series_values(series.get("ADs", {}))
+        rf = p.get("recommended_funnel_level", p.get("recommended_level", 1))
+        ra = p.get("recommended_ads_level", 1)
+
+        if start_l1 > 0 or complete_l1 > 0:
+            insights.append(
+                f"{pk}: L1 Start {_fmt_int(start_l1)}, L1 Complete {_fmt_int(complete_l1)} | "
+                f"guvenilir funnel bandi L{rf}+."
+            )
+        if ads_total > 0:
+            insights.append(
+                f"{pk}: toplam rewarded/ad event {_fmt_int(ads_total)} "
+                f"(ADs yorum bandi L{ra}+)."
+            )
+        if fail_total > 0 or try_total > 0:
+            insights.append(
+                f"{pk}: toplam Fail {_fmt_int(fail_total)} | Tryagain {_fmt_int(try_total)}."
+            )
+
+        hot = p.get("churn", {}).get("hotspots", [])
+        if hot:
+            top = hot[:3]
+            labels = _report_metric_labels(report)
+            hotspot_txt = ", ".join(
+                _format_churn_hotspot_label(x, labels) for x in top
+            )
+            insights.append(f"{pk}: oncelikli churn levelleri -> {hotspot_txt}.")
+
+    if not insights:
+        insights = ["Insight uretilemedi (yetersiz veri)."]
+    return insights
+
+
+def _extract_platform_metrics_from_sheet(wb, sheet_name, max_level):
+    """
+    Insight icin dogrudan otomatik analiz workbook tablosundan metrik ceker.
+    And/IOS kolon semasi:
+      B: Start, C: Complete, D: Fail, E: Tryagain, N: Total $, T: rewarded ratio
+    """
+    ws = _worksheet_by_name(wb, sheet_name)
+    if ws is None:
+        return {}
+    level_rows = find_level_rows(ws)
+    if not level_rows:
+        return {}
+
+    def _cell_num(r, c):
+        try:
+            return float(pd.to_numeric(ws.cell(row=r, column=c).value, errors="coerce"))
+        except Exception:
+            return 0.0
+
+    out = {
+        "start_total": 0.0,
+        "complete_total": 0.0,
+        "fail_total": 0.0,
+        "tryagain_total": 0.0,
+        "revenue_total": 0.0,
+        "rewarded_ratio_avg": 0.0,
+        "rewarded_ratio_count": 0,
+        "l1_start": 0.0,
+        "l1_complete": 0.0,
+    }
+    for lvl in range(1, max_level + 1):
+        r = level_rows.get(lvl)
+        if not r:
+            continue
+        s = _cell_num(r, 2)
+        c = _cell_num(r, 3)
+        f = _cell_num(r, 4)
+        t = _cell_num(r, 5)
+        rev = _cell_num(r, 14)
+        rew_ratio = _cell_num(r, 20)
+
+        if lvl == 1:
+            out["l1_start"] = s
+            out["l1_complete"] = c
+        out["start_total"] += s
+        out["complete_total"] += c
+        out["fail_total"] += f
+        out["tryagain_total"] += t
+        out["revenue_total"] += rev
+        if rew_ratio > 0:
+            out["rewarded_ratio_avg"] += rew_ratio
+            out["rewarded_ratio_count"] += 1
+
+    if out["rewarded_ratio_count"] > 0:
+        out["rewarded_ratio_avg"] = out["rewarded_ratio_avg"] / out["rewarded_ratio_count"]
+    return out
+
+
+def _extract_workbook_insight_context(wb, max_level):
+    return {
+        "Android": _extract_platform_metrics_from_sheet(wb, "And", max_level),
+        "iOS": _extract_platform_metrics_from_sheet(wb, "IOS", max_level),
+    }
+
+
+def _apply_workbook_context_to_report(report, workbook_context):
+    """
+    Insight dilini workbook metriklerine yaslamak icin rapora tablo-odakli ozet ekler.
+    """
+    if not workbook_context:
+        return report
+    r = dict(report)
+    r["workbook_context"] = workbook_context
+    return r
+
+
+def _build_auto_insights_from_workbook(report):
+    """
+    Oncelik: otomatik analiz dosyasina yazilan And/IOS tablo degerleri.
+    """
+    ctx = report.get("workbook_context") or {}
+    if not ctx:
+        return _build_auto_insights(report)
+
+    insights = []
+    game = report.get("game_name", "Oyun")
+    date_range = report.get("date_range", "-")
+    max_level = report.get("max_level", 0)
+    insights.append(f"{game} | {date_range} donemi, dosya bazli analiz limiti L{max_level}.")
+
+    and_m = ctx.get("Android", {})
+    ios_m = ctx.get("iOS", {})
+    total_rev = float(and_m.get("revenue_total", 0.0)) + float(ios_m.get("revenue_total", 0.0))
+    if total_rev > 0:
+        a_rev = float(and_m.get("revenue_total", 0.0))
+        i_rev = float(ios_m.get("revenue_total", 0.0))
+        insights.append(
+            f"Dosyaya yazilan toplam purchase revenue ${total_rev:,.0f} "
+            f"(Android ${a_rev:,.0f}, iOS ${i_rev:,.0f})."
+        )
+
+    for pk, m in (("Android", and_m), ("iOS", ios_m)):
+        if not m:
+            continue
+        l1s = float(m.get("l1_start", 0.0))
+        l1c = float(m.get("l1_complete", 0.0))
+        if l1s > 0 or l1c > 0:
+            insights.append(
+                f"{pk}: dosya tablosunda L1 Start {_fmt_int(l1s)}, L1 Complete {_fmt_int(l1c)}."
+            )
+        f_total = float(m.get("fail_total", 0.0))
+        t_total = float(m.get("tryagain_total", 0.0))
+        if f_total > 0 or t_total > 0:
+            insights.append(
+                f"{pk}: toplam Fail {_fmt_int(f_total)} | Tryagain {_fmt_int(t_total)} (dosya toplam)."
+            )
+        rew_avg = float(m.get("rewarded_ratio_avg", 0.0))
+        if rew_avg > 0:
+            insights.append(
+                f"{pk}: ortalama rewarded/complete orani ~{rew_avg:.2f} (T sutunu ortalamasi)."
+            )
+
+    # Churn ve kalite notlari yine kalite raporundan gelir
+    for pk in ("Android", "iOS"):
+        p = report["platforms"].get(pk, {})
+        hot = sorted(p.get("churn", {}).get("hotspots", []), key=lambda x: x["level"])
+        if hot:
+            top = hot[:5]
+            labels = _report_metric_labels(report)
+            hotspot_txt = ", ".join(
+                _format_churn_hotspot_label(x, labels) for x in top
+            )
+            insights.append(f"{pk}: churn uyari levelleri (level sirasi) -> {hotspot_txt}.")
+
+    return insights
+
+
 def build_data_quality_report(
     data_android,
     data_ios,
@@ -1348,8 +1830,15 @@ def build_data_quality_report(
     country_code,
     max_level,
     source_files,
+    revenue_android_df=None,
+    revenue_ios_df=None,
+    revenue_source="",
+    metric_labels=None,
 ):
     """Tum platformlar icin ozet + kalite + churn raporu."""
+    metric_labels = metric_labels or {"k_label": "%", "h_label": "Drop 1"}
+    k_label = metric_labels.get("k_label") or "%"
+    h_label = metric_labels.get("h_label") or "Drop 1"
     platforms = {}
     for label, data in (("Android", data_android), ("iOS", data_ios)):
         if not any(
@@ -1380,9 +1869,9 @@ def build_data_quality_report(
         "erken level'larda kullanici sayisi dusuk veya 0 gorunebilir. Bu gercek "
         "drop degil; ozellik henuz set edilmemis veya funnel filtresine girmemis "
         "kullanicilardan kaynaklanir.",
-        "And/IOS/K (%) analizinde Level 1-2 yerine asagidaki 'Onerilen baslangic' "
+        f"And/IOS/{k_label} analizinde Level 1-2 yerine asagidaki 'Onerilen baslangic' "
         "level'inden itibaren yorum yapin.",
-        "Drop-off (K) ve Drop 1 (H) formulleri dusuk level'de yanıltici olabilir; "
+        f"{k_label} ve {h_label} formulleri dusuk level'de yanıltici olabilir; "
         "guvenilir band sonrasi trendlere odaklanin.",
     ]
     for pk, short in (("Android", "And"), ("iOS", "IOS")):
@@ -1390,9 +1879,12 @@ def build_data_quality_report(
         rf = p.get("recommended_funnel_level", p.get("recommended_level", 1))
         ra = p.get("recommended_ads_level", 1)
         global_warn.append(
-            f"{pk}: funnel (K/H) L{rf}+ | ADs/rewarded (T) L{ra}+"
+            f"{pk}: funnel ({k_label}/{h_label}) L{rf}+ | ADs/rewarded (T) L{ra}+"
         )
 
+    revenue_summary = _build_revenue_summary(
+        revenue_android_df, revenue_ios_df, revenue_source
+    )
     return {
         "game_name": game_name,
         "date_range": date_range,
@@ -1401,8 +1893,48 @@ def build_data_quality_report(
         "source_files": [os.path.basename(p) for p in source_files],
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "platforms": platforms,
+        "revenue_summary": revenue_summary,
         "global_warnings": global_warn,
+        "metric_labels": metric_labels,
+        "insights": [],
     }
+
+
+def _ozet_metric_legend_rows(metric_labels=None):
+    """And/IOS satir 2 basliklariyla Ozet metrik sozlugu."""
+    labels = metric_labels or {}
+    k_label = labels.get("k_label") or "%"
+    h_label = labels.get("h_label") or "Drop 1"
+    return [
+        [
+            k_label,
+            f"And/IOS {k_label} sutunu (retention). L1 Complete'a gore bu levelda kalan oyuncu orani. "
+            "Yuksek = iyi.",
+        ],
+        [
+            f"{k_label} durumu",
+            f"{k_label} renk esigi (level bandina gore): Yesil=iyi, Sari=orta, Kirmizi=dusuk retention.",
+        ],
+        [
+            h_label,
+            f"And/IOS {h_label} sutunu. Bu leveldan bir sonraki levela geciste Complete dususu (%). "
+            "Ani kayip gostergesi.",
+        ],
+        [
+            f"{h_label} durumu",
+            f"{h_label} renk esigi: OK=<%8.5, Sari=%8.5-10, Kirmizi=>%10 (ani dusus).",
+        ],
+        [
+            "Churn tablosu",
+            f"Asagidaki leveller yalnizca Kirmizi/Sari {k_label} veya {h_label} olan satirlardir; "
+            "level numarasina gore kucukten buyuge siralanir.",
+        ],
+        [
+            "Guvenilir band",
+            "Erken level segmentasyon artefakti olabilir; 'Platform — guvenilir analiz bandi' "
+            "satirindaki Lx+ sonrasina odaklanin.",
+        ],
+    ]
 
 
 def _ozet_set_cell(ws, row, col, value, *, bold=False, fill=None, wrap=False):
@@ -1440,7 +1972,11 @@ def _write_ozet_table(ws, start_row, title, headers, rows, section_fill, warn_fi
             row = row[:-1]
         fill = _ozet_row_fill(k_cls, d_cls, warn_fill, bad_fill) if (k_cls or d_cls) else None
         for ci, val in enumerate(row, 1):
-            _ozet_set_cell(ws, r, ci, val, fill=fill)
+            c = _ozet_set_cell(ws, r, ci, val, fill=fill)
+            if ci == 1 and title.startswith("4) Metrik"):
+                c.alignment = Alignment(wrap_text=True, vertical="top")
+            if ci == 2 and title.startswith("4) Metrik"):
+                c.alignment = Alignment(wrap_text=True, vertical="top")
         r += 1
     return r + 1
 
@@ -1450,6 +1986,9 @@ def write_ozet_sheet(wb, report):
     if SUMMARY_SHEET_NAME in wb.sheetnames:
         del wb[SUMMARY_SHEET_NAME]
     ws = wb.create_sheet(SUMMARY_SHEET_NAME, 0)
+    metric_labels = _report_metric_labels(report)
+    k_label = metric_labels["k_label"]
+    h_label = metric_labels["h_label"]
 
     section_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     warn_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
@@ -1458,6 +1997,19 @@ def write_ozet_sheet(wb, report):
     r = 1
     ws.cell(row=r, column=1, value="Ozet — Veri kalitesi ve churn").font = Font(bold=True, size=14)
     r += 2
+
+    insight_rows = [[line] for line in (report.get("insights") or [])]
+    if insight_rows:
+        r = _write_ozet_table(
+            ws,
+            r,
+            "0) Insights (otomatik)",
+            ["Insight"],
+            insight_rows,
+            section_fill,
+            warn_fill,
+            bad_fill,
+        )
 
     r = _write_ozet_table(
         ws,
@@ -1492,7 +2044,12 @@ def write_ozet_sheet(wb, report):
         ws,
         r,
         "2) Platform — guvenilir analiz bandi",
-        ["Platform", "Funnel (K,H)", "ADs (T)", "Churn uyarisi sayisi"],
+        [
+            "Platform",
+            f"Funnel ({k_label},{h_label})",
+            "ADs (T)",
+            f"{k_label}/{h_label} uyarili level sayisi",
+        ],
         plat_rows,
         section_fill,
         warn_fill,
@@ -1505,6 +2062,17 @@ def write_ozet_sheet(wb, report):
         "3) Notlar (segmentasyon / erken level)",
         ["Aciklama"],
         [[line] for line in report["global_warnings"][:6]],
+        section_fill,
+        warn_fill,
+        bad_fill,
+    )
+
+    r = _write_ozet_table(
+        ws,
+        r,
+        f"4) Metrik sozlugu — {k_label} ve {h_label} (And/IOS satir 2)",
+        ["Metrik", "Ne anlama geliyor?"],
+        _ozet_metric_legend_rows(metric_labels),
         section_fill,
         warn_fill,
         bad_fill,
@@ -1530,25 +2098,26 @@ def write_ozet_sheet(wb, report):
                     ("__class__", item["k_class"], item["drop1_class"]),
                 ]
             )
+    churn_rows.sort(key=lambda row: (0 if row[0] == "Android" else 1, int(row[1])))
     if not churn_rows:
         churn_rows = [["—", "—", "", "", "", "", "", "", "", "", "", "Uyari yok"]]
     r = _write_ozet_table(
         ws,
         r,
-        "4) Churn — oncelikli leveller (Kirmizi/Sari K veya H)",
+        f"5) Churn — uyari levelleri (level sirasina gore; {k_label}/{h_label} Kirmizi veya Sari)",
         [
             "Platform",
             "Level",
             "Start",
             "Complete",
             "Complete/Start %",
-            "K %",
-            "K durum",
-            "Drop1 %",
-            "H durum",
+            k_label,
+            f"{k_label} durumu",
+            h_label,
+            f"{h_label} durumu",
             "Fail",
             "Tryagain",
-            "Not",
+            "Kisa not",
         ],
         churn_rows,
         section_fill,
@@ -1576,7 +2145,7 @@ def write_ozet_sheet(wb, report):
         r = _write_ozet_table(
             ws,
             r,
-            "5) Level banti ozeti",
+            "6) Level banti ozeti",
             [
                 "Platform",
                 "Bant",
@@ -1597,7 +2166,7 @@ def write_ozet_sheet(wb, report):
     _write_ozet_table(
         ws,
         r,
-        "6) Kaynak dosyalar",
+        "7) Kaynak dosyalar",
         ["Dosya"],
         [[fn] for fn in report["source_files"]],
         section_fill,
@@ -1605,7 +2174,7 @@ def write_ozet_sheet(wb, report):
         bad_fill,
     )
 
-    widths = [14, 8, 10, 10, 14, 8, 10, 10, 10, 8, 10, 28]
+    widths = [14, 10, 10, 10, 14, 14, 12, 12, 12, 8, 10, 28]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     print(f"   OK '{SUMMARY_SHEET_NAME}' sekmesi eklendi (tablo ozeti + churn).")
@@ -1617,6 +2186,63 @@ def _platform_has_funnel_data(data_by_funnel):
         if df is not None and not df.empty:
             return True
     return False
+
+
+def _parse_level_value(v):
+    """'23' / 23 / 'Lv. 23' -> int; okunamazsa None."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        if float(v) != float(v):  # NaN
+            return None
+        return int(v)
+    s = str(v).strip()
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _parse_money_value(v):
+    """12.5 / '$31' / '$10.39' -> float."""
+    if v is None:
+        return 0.0
+    try:
+        if pd.isna(v):
+            return 0.0
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, bool):
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = (
+        str(v)
+        .strip()
+        .replace("$", "")
+        .replace(",", "")
+        .replace("\u00a0", "")
+        .strip()
+    )
+    n = pd.to_numeric(s, errors="coerce")
+    return float(n) if pd.notna(n) else 0.0
+
+
+def _game_keys_match(cell, detected):
+    if not detected:
+        return True
+    a = re.sub(r"[^a-z0-9]+", "", str(cell).lower())
+    b = re.sub(r"[^a-z0-9]+", "", str(detected).lower())
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
 
 
 def _find_revenue_value_column(df):
@@ -1671,7 +2297,7 @@ def _print_purchase_export_naming_requirement(unlabeled_paths=None):
         print("")
         print("   Etiketsiz dosyalar:")
         for p in unlabeled_paths:
-            print(f"     - {os.path.basename(p)}")
+            print(f"     - {_safe_console_text(os.path.basename(p))}")
     print("")
     print("   --- Analytics / export ekibine iletilebilecek metin ---")
     print(
@@ -1695,10 +2321,11 @@ def _warn_unlabeled_purchase_files(unlabeled_paths, and_parts, ios_parts):
         )
 
 
-def _read_revenue_level_table(path):
+def _read_revenue_level_table(path, game_name=None):
     """
-    detailed_level_table csv/xlsx: Level + Revenue ($) -> Level, Total $.
-    Level sirasi duzensiz olabilir; level'a gore toplanir ve siralanir.
+    Level + Revenue -> Level, Total $.
+    detailed_level_table (sayisal Level, Revenue ($)) ve
+    top_levels_by_purchase_count (Lv. 23, $31, Game) desteklenir.
     """
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
@@ -1708,19 +2335,32 @@ def _read_revenue_level_table(path):
     if df is None or df.empty:
         return pd.DataFrame()
     level_col = None
+    game_col = None
     for col in df.columns:
-        if str(col).strip().lower() == "level":
+        key = str(col).strip().lower()
+        if key == "level" and level_col is None:
             level_col = col
-            break
+        if key == "game" and game_col is None:
+            game_col = col
     if level_col is None:
         return pd.DataFrame()
     rev_col = _find_revenue_value_column(df)
     if rev_col is None:
         return pd.DataFrame()
+    if game_col is not None and game_name:
+        mask = df[game_col].map(lambda x: _game_keys_match(x, game_name))
+        if mask.any():
+            df = df.loc[mask].copy()
+        else:
+            print(
+                f"   UYARI: '{os.path.basename(path)}' icinde oyun "
+                f"'{game_name}' satiri yok; bu dosyada gelir atlandi."
+            )
+            return pd.DataFrame()
     sub = df[[level_col, rev_col]].copy()
     sub.columns = ["Level", "Total $"]
-    sub["Level"] = pd.to_numeric(sub["Level"], errors="coerce")
-    sub["Total $"] = pd.to_numeric(sub["Total $"], errors="coerce").fillna(0)
+    sub["Level"] = sub["Level"].map(_parse_level_value)
+    sub["Total $"] = sub["Total $"].map(_parse_money_value)
     sub = sub.dropna(subset=["Level"])
     sub["Level"] = sub["Level"].astype(int)
     out = sub.groupby("Level", as_index=False)["Total $"].sum()
@@ -1735,7 +2375,7 @@ def _prompt_revenue_file_platforms(unlabeled_paths):
     print("   Simdilik hangi dosyanin Google oldugunu secin.")
     print("   (Bir sonraki analiz icin dosyalari google_/ios_ ile yeniden adlandirin.)\n")
     for i, p in enumerate(unlabeled_paths, 1):
-        print(f"     {i}) {os.path.basename(p)}")
+        print(f"     {i}) {_safe_console_text(os.path.basename(p))}")
     while True:
         try:
             raw = input(
@@ -1768,21 +2408,43 @@ def _merge_revenue_parts(parts):
 
 
 def _collect_revenue_level_table_paths(script_dir):
-    paths = []
+    """
+    Oncelik: detailed_level_table.
+    Yoksa: top_levels_by_purchase_count / purchase_count_game_breakdown.
+    """
+    detailed = []
     for pattern in ("*detailed_level_table*.csv", "*detailed_level_table*.xlsx"):
-        paths.extend(glob.glob(os.path.join(script_dir, pattern)))
-    paths = [
+        detailed.extend(glob.glob(os.path.join(script_dir, pattern)))
+    detailed = [
         p
-        for p in paths
+        for p in detailed
         if not _is_output_workbook(os.path.basename(p))
         and not _is_template_workbook(os.path.basename(p))
     ]
-    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return paths
+    if detailed:
+        detailed.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return detailed
+
+    breakdown = []
+    for pattern in (
+        "*top_levels_by_purchase*.csv",
+        "*purchase_count_game_breakdown*.csv",
+    ):
+        breakdown.extend(glob.glob(os.path.join(script_dir, pattern)))
+    seen = set()
+    uniq = []
+    for p in breakdown:
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    uniq.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return uniq
 
 
-def _load_detailed_level_table_revenue(script_dir, data_android, data_ios):
-    """Google / iOS ayri detailed_level_table dosyalarini And/IOS Total $ olarak yukler."""
+def _load_detailed_level_table_revenue(script_dir, data_android, data_ios, game_name=None):
+    """Google / iOS ayri detailed_level_table veya purchase breakdown -> And/IOS Total $."""
     paths = _collect_revenue_level_table_paths(script_dir)
     if not paths:
         return pd.DataFrame(), pd.DataFrame(), ""
@@ -1790,7 +2452,10 @@ def _load_detailed_level_table_revenue(script_dir, data_android, data_ios):
     print("   Purchase dosyalari:")
     for p in paths:
         plat = _detect_revenue_platform_from_filename(p)
-        print(f"     - {os.path.basename(p)}  ->  {_purchase_platform_display_label(plat)}")
+        print(
+            f"     - {_safe_console_text(os.path.basename(p))}  ->  "
+            f"{_purchase_platform_display_label(plat)}"
+        )
 
     and_parts = []
     ios_parts = []
@@ -1798,7 +2463,7 @@ def _load_detailed_level_table_revenue(script_dir, data_android, data_ios):
 
     for p in paths:
         plat = _detect_revenue_platform_from_filename(p)
-        part = _read_revenue_level_table(p)
+        part = _read_revenue_level_table(p, game_name=game_name)
         if part.empty:
             continue
         if plat == "and":
@@ -1809,8 +2474,10 @@ def _load_detailed_level_table_revenue(script_dir, data_android, data_ios):
             unlabeled.append(p)
 
     if unlabeled and not and_parts and not ios_parts and len(unlabeled) == 1:
-        _print_purchase_export_naming_requirement(unlabeled)
-        merged = _read_revenue_level_table(unlabeled[0])
+        base = os.path.basename(unlabeled[0]).lower()
+        if "detailed_level_table" in base:
+            _print_purchase_export_naming_requirement(unlabeled)
+        merged = _read_revenue_level_table(unlabeled[0], game_name=game_name)
         has_and = _platform_has_funnel_data(data_android)
         has_ios = _platform_has_funnel_data(data_ios)
         src = os.path.basename(unlabeled[0]) + " (platform etiketi yok; funnel'a gore)"
@@ -1831,9 +2498,13 @@ def _load_detailed_level_table_revenue(script_dir, data_android, data_ios):
     if len(unlabeled) == 2 and not and_parts and not ios_parts:
         assigned = _prompt_revenue_file_platforms(unlabeled)
         if assigned.get("and"):
-            and_parts.append(_read_revenue_level_table(assigned["and"]))
+            and_parts.append(
+                _read_revenue_level_table(assigned["and"], game_name=game_name)
+            )
         if assigned.get("ios"):
-            ios_parts.append(_read_revenue_level_table(assigned["ios"]))
+            ios_parts.append(
+                _read_revenue_level_table(assigned["ios"], game_name=game_name)
+            )
         src = (
             f"And={os.path.basename(assigned['and'])}; "
             f"IOS={os.path.basename(assigned['ios'])}"
@@ -1854,7 +2525,13 @@ def _load_detailed_level_table_revenue(script_dir, data_android, data_ios):
         names.append("And")
     if ios_parts:
         names.append("IOS")
-    src = "detailed_level_table (" + ", ".join(names) + ")"
+    first = os.path.basename(paths[0]).lower()
+    kind = (
+        "detailed_level_table"
+        if "detailed_level_table" in first
+        else "purchase_breakdown"
+    )
+    src = kind + " (" + ", ".join(names) + ")"
     return and_df, ios_df, src
 
 
@@ -1889,14 +2566,15 @@ def _load_revenue_from_csv(script_dir):
     return csv_and, csv_ios, f"veri-*.csv ({names})"
 
 
-def load_purchase_revenue(script_dir, data_android, data_ios):
+def load_purchase_revenue(script_dir, data_android, data_ios, game_name=None):
     """
     And/IOS N (Total $) sutunu icin level bazli gelir.
-    Oncelik: *detailed_level_table*.csv / *.xlsx (Revenue ($); Google/IOS ayri dosya).
+    Oncelik: *detailed_level_table*.csv / *.xlsx
+    Sonra: top_levels_by_purchase_count / purchase_count_game_breakdown CSV
     Yedek: veri-*.csv (Store Name ile And/IOS ayrimi).
     """
     and_df, ios_df, src = _load_detailed_level_table_revenue(
-        script_dir, data_android, data_ios
+        script_dir, data_android, data_ios, game_name=game_name
     )
     if src:
         return and_df, ios_df, src
@@ -1911,13 +2589,19 @@ def print_quality_report_console(report):
         p = report["platforms"].get(pk, {})
         rf = p.get("recommended_funnel_level", p.get("recommended_level", 1))
         ra = p.get("recommended_ads_level", 1)
-        hot = p.get("churn", {}).get("hotspots", [])
-        top = ", ".join(f"L{x['level']}" for x in hot[:5]) if hot else "yok"
+        hot = sorted(p.get("churn", {}).get("hotspots", []), key=lambda x: x["level"])
+        top = ", ".join(f"L{x['level']}" for x in hot[:8]) if hot else "yok"
         print(f"  {pk}: funnel L{rf}+ | ADs L{ra}+ | churn uyarisi: {top}")
+    insights = report.get("insights") or []
+    if insights:
+        print("  Insights:")
+        for line in insights[:6]:
+            print(f"   - {line}")
     print("  Detay tablolar: Excel > 'Ozet' sekmesi.\n")
 
 
 def main():
+    _configure_stdout_utf8()
     # #region agent log
     _agent_debug_log(
         "H1",
@@ -1928,19 +2612,16 @@ def main():
     )
     # #endregion
     print("=======================================================")
-    print(" Hole Pool Veri Isleme Scripti Baslatiliyor...")
+    print(" Fur Agent — Otomatik Analiz baslatiliyor...")
     print("=======================================================\n")
 
-    max_level = get_max_level_from_user()
-    print(f"\n[OK] Analiz {max_level}. levele kadar yapilacak.\n")
-
-    # 1. Veri dosyalarini SCRIPT_DIR icinde tara (cwd'den bagimsiz)
+    # 1. Veri dosyalarini SCRIPT_DIR icinde tara (oyun adi metaveriden okunur)
     print("1. Veri dosyalari (xlsx) taraniyor...")
     print(f"   Klasor: {os.path.normpath(SCRIPT_DIR)}")
     files, date_dict, game_dict, skipped = collect_data_xlsx_files(SCRIPT_DIR)
 
     if not files:
-        print("HATA: Gecerli veri dosyasi bulunamadi (hole-pool etiketi veya OS+Level+funnel yapisinda xlsx).")
+        print("HATA: Gecerli veri dosyasi bulunamadi (oyun metaverisi veya OS+Level+funnel yapisinda xlsx).")
         if skipped:
             print("   Atlanan dosyalar (ilk 20):")
             for name, why in skipped[:20]:
@@ -1949,20 +2630,22 @@ def main():
                 print(f"     ... ve {len(skipped) - 20} dosya daha")
         sys.exit(1)
 
+    detected_game = _resolve_detected_game_name(game_dict)
+    if detected_game:
+        print(f"   OK Oyun: {detected_game}")
+    else:
+        detected_game = "Hole_Pool"
+        print(
+            "   UYARI: Oyun metaverisi bulunamadi (# Farm Block Escape gibi); "
+            "cikti adi varsayilan Hole_Pool olacak."
+        )
+
+    max_level = get_max_level_from_user()
+    print(f"\n[OK] Analiz {max_level}. levele kadar yapilacak.\n")
+
     if skipped:
         print(f"   Bilgi: {len(skipped)} dosya atlandi (sablon/cikti veya veri degil).")
     print(f"   OK {len(files)} adet veri dosyasi tespit edildi.")
-    game_names = [g for g in game_dict.values() if g]
-    if game_names:
-        # Birden fazla oyun etiketi varsa en sik geceni baz al.
-        game_counter = {}
-        for g in game_names:
-            game_counter[g] = game_counter.get(g, 0) + 1
-        detected_game = sorted(game_counter.items(), key=lambda x: (-x[1], x[0]))[0][0]
-        print(f"   OK Oyun metaverisi: {detected_game}")
-    else:
-        detected_game = "Hole_Pool"
-        print("   UYARI: Oyun metaverisi bulunamadi; varsayilan ad kullanilacak (Hole_Pool).")
     unique_dates = set(date_dict.values())
     if len(unique_dates) > 1:
         print(f"   UYARI: Tarih farkliligi var: {unique_dates}")
@@ -1971,32 +2654,65 @@ def main():
 
     # 2. Verileri oku ve funnel tipine gore ayristir
     print("2. Veriler okunuyor...")
-    data_android = {} # { funnel_type: df }
-    data_ios     = {}
+    data_android = {}  # { funnel_type: list[df] }
+    data_ios = {}
+    data_unspecified = {}
+    missing_platform_files = []
 
     for f in files:
-        funnel, df_and, df_ios = read_platform_data(f)
-        print(f"   {os.path.basename(f)} -> {funnel}")
-        if funnel not in data_android: data_android[funnel] = []
-        if funnel not in data_ios:     data_ios[funnel]     = []
-        data_android[funnel].append(df_and)
-        data_ios[funnel].append(df_ios)
+        funnel, df_and, df_ios, has_platform = read_platform_data(f)
+        n_and = 0 if df_and is None or df_and.empty else len(df_and)
+        n_ios = 0 if df_ios is None or df_ios.empty else len(df_ios)
+        if has_platform:
+            print(f"   {os.path.basename(f)} -> {funnel} (And {n_and} / IOS {n_ios})")
+        else:
+            n_all = n_and
+            print(
+                f"   {os.path.basename(f)} -> {funnel} "
+                f"({n_all} satir, Platform yok)"
+            )
+        if has_platform:
+            if funnel not in data_android:
+                data_android[funnel] = []
+            if funnel not in data_ios:
+                data_ios[funnel] = []
+            data_android[funnel].append(df_and)
+            data_ios[funnel].append(df_ios)
+        else:
+            if funnel not in data_unspecified:
+                data_unspecified[funnel] = []
+            data_unspecified[funnel].append(df_and)
+            missing_platform_files.append(os.path.basename(f))
+
+    if data_unspecified:
+        target = get_unspecified_platform_target_from_user(missing_platform_files)
+        label = {"and": "And", "ios": "IOS", "both": "And+IOS"}[target]
+        print(f"   -> Platform'siz veri '{label}' sekmesine yazilacak.\n")
+        for ftype, dfs in data_unspecified.items():
+            if target in ("and", "both"):
+                data_android.setdefault(ftype, []).extend(dfs)
+            if target in ("ios", "both"):
+                copies = [d.copy() for d in dfs] if target == "both" else dfs
+                data_ios.setdefault(ftype, []).extend(copies)
 
     # Aynı funnel tipindeki dosyalari birlestir (Eger varsa)
     for ftype in list(data_android.keys()):
         data_android[ftype] = safe_concat(data_android[ftype])
     for ftype in list(data_ios.keys()):
-        data_ios[ftype]     = safe_concat(data_ios[ftype])
+        data_ios[ftype] = safe_concat(data_ios[ftype])
 
     # 3. Gelir verileri (oncelik: detailed_level_table xlsx, yedek: veri-*.csv)
     print("3. Gelir (revenue) verileri okunuyor...")
     csv_and_usd, csv_ios_usd, revenue_src = load_purchase_revenue(
-        SCRIPT_DIR, data_android, data_ios
+        SCRIPT_DIR, data_android, data_ios, detected_game
     )
     if revenue_src:
         print(f"   OK Gelir kaynagi: {revenue_src}")
     else:
-        print("   Bilgi: Gelir dosyasi bulunamadi (detailed_level_table csv/xlsx veya veri-*.csv).")
+        print(
+            "   Bilgi: Gelir dosyasi bulunamadi "
+            "(detailed_level_table, top_levels_by_purchase veya veri-*.csv)."
+        )
 
     # 4. Yazma Islemi
     print("4. Sablona yaziliyor...")
@@ -2104,6 +2820,7 @@ def main():
     if "ARPU" in wb.sheetnames and "Av.Rw" in wb.sheetnames:
         apply_arpu_avgrw_level_formulas_and_charts(wb, arpu_chart_max_level)
 
+    metric_labels = _extract_and_ios_metric_labels(wb)
     quality_report = build_data_quality_report(
         data_android,
         data_ios,
@@ -2112,7 +2829,14 @@ def main():
         country_code=country_code,
         max_level=max_level,
         source_files=files,
+        revenue_android_df=csv_and_usd,
+        revenue_ios_df=csv_ios_usd,
+        revenue_source=revenue_src,
+        metric_labels=metric_labels,
     )
+    workbook_ctx = _extract_workbook_insight_context(wb, max_level)
+    quality_report = _apply_workbook_context_to_report(quality_report, workbook_ctx)
+    quality_report["insights"] = _build_auto_insights_from_workbook(quality_report)
     write_ozet_sheet(wb, quality_report)
     print_quality_report_console(quality_report)
 
