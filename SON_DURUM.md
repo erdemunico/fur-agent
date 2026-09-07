@@ -4,10 +4,11 @@ Bu dosya, projede degisiklik yaparken once neyin korunacagini netlestirmek ve
 "bir yeri duzeltirken baska bir yeri bozma" riskini azaltmak icin tutulur.
 
 ## 1) Guncel Durum
-- Yerel proje klasoru: `C:\Users\erdem\Desktop\cursor projects\fur-agent`
+- Yerel proje klasoru (tek kaynak): `C:\Users\erdem\Desktop\cursor projects\fur-agent`
 - GitHub repo: `git@github.com-unico:erdemunico/fur-agent.git`
-- Kanonik branch: `main` (funnel_main icerigi buraya tasindi)
-- Bundan sonra yalnizca `main` kullanilir.
+- Tek branch: `main`
+- Cursor sohbetleri ve agent isleri yalnizca bu klasor + `main` uzerinden yapilir.
+- Eski `funnel_main` kaldirildi; yeni branch acilmaz (gerekirse once konuyla).
 
 ## 2) Kritik Dosya Politikasi
 
@@ -221,5 +222,17 @@ Her is bittiginde bu formati ekle:
   - Purchase breakdown CSV ignore listesine eklendi.
   - Kanonik branch artik `main`.
 - Dogrulama: `git checkout main`, `git merge funnel_main`, push.
-- Risk/Not: `funnel_main` gecici tutulabilir; yeni is `main` uzerinde.
+- Risk/Not: `funnel_main` silindi; yalniz `main` kaldi.
+- Commit: `4cc8ddd`
+
+---
+- Tarih: 2026-09-07
+- Branch: `main`
+- Amac: Tek klasor + tek branch kurali; `funnel_main` silindi.
+- Etkilenen dosyalar: `SON_DURUM.md`
+- Davranis degisimi:
+  - Agent/sohbet isleri yalnizca Desktop `fur-agent` + `main`.
+  - Yerel ve remote `funnel_main` kaldirildi.
+- Dogrulama: `git branch -a` sadece `main` gosterir.
+- Risk/Not: Eski sohbetlerde funnel_main gecse bile bundan sonra `main` kullanilir.
 - Commit: (bu guncellemeden sonra eklenecek)
