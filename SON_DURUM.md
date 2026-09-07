@@ -6,9 +6,8 @@ Bu dosya, projede degisiklik yaparken once neyin korunacagini netlestirmek ve
 ## 1) Guncel Durum
 - Yerel proje klasoru: `C:\Users\erdem\Desktop\cursor projects\fur-agent`
 - GitHub repo: `git@github.com-unico:erdemunico/fur-agent.git`
-- Aktif branch: `funnel_main`
-- `main` ve `funnel_main` GitHub ile senkron.
-- Son ortak commit: `7e09556`
+- Kanonik branch: `main` (funnel_main icerigi buraya tasindi)
+- Bundan sonra yalnizca `main` kullanilir.
 
 ## 2) Kritik Dosya Politikasi
 
@@ -59,6 +58,28 @@ Bu dosya, projede degisiklik yaparken once neyin korunacagini netlestirmek ve
 - Etiketsiz dosya adlari (yalnizca timestamp) script tarafindan otomatik ayirt edilemez.
 - Script etiketsiz dosyalarda konsola uyari ve analytics ekibine iletilecek metin basar.
 - Iki etiketsiz dosya varsa gecici olarak kullaniciya sorulur; 3+ etiketsiz dosyada gelir yazilmaz.
+- `detailed_level_table` yoksa yedek: `top_levels_by_purchase_count_game_breakdown_*.csv`
+  (`Lv. 23`, `$31`, `Game`). Level/Revenue parse edilir; oyun adi eslesirse filtrelenir.
+  Platform yoksa gelir, funnel'in yazildigi sekmeye (And / IOS / both) gider.
+
+### Platform / network / app version
+- Tercih edilen export: `Operating system` veya `Platform` (Android / iOS).
+- Platform yoksa (yalnizca `App version` + `user_network`) dosya atlanmaz.
+- Ayni level birden fazla network/version satirina kirilmissa sayimlar toplanir.
+- `avarage_attempt` / `avg_thinktime` calculated metric olarak gelir; script yeniden hesaplamaz.
+- Platform yoksa script And / IOS / both sorar (Enter = And).
+
+### Ozet / Insights otomasyonu
+- `Ozet` sekmesinin en ustunde `Insights (otomatik)` alani vardir.
+- Insight metinleri yalnizca mevcut veriden uretilir (uydurma metrik yok).
+- Veri yoksa ilgili satir yazilmaz; kalip zorlama yapilmaz.
+- Oncelikli kaynak, otomatik analiz dosyasina yazilan `And/IOS` tablo degerleridir
+  (L1 Start/Complete, Fail, Tryagain, Total $, T sutunu ortalamasi).
+- Kaynaklar:
+  - Funnel serileri (Start/Complete/Fail/Tryagain/ADs)
+  - Churn hotspot tablosu (K/H siniflari)
+  - Purchase revenue ozeti (`Total $`, varsa And/IOS payi)
+- Insight dili serbesttir; sabit template yerine verinin sundugu kadar cümle uretilir.
 
 ## 4) Is Akisi (Bozmadan Ilerleme)
 Her degisiklikte bu sirayla ilerle:
@@ -144,3 +165,61 @@ Her is bittiginde bu formati ekle:
 - Dogrulama: `git status`, `git push` funnel_main.
 - Risk/Not: Cursor'da yeni klasoru ac; script `SCRIPT_DIR` kullandigi icin kod degisikligi gerekmez.
 - Commit: `ea30c7f`
+
+---
+- Tarih: 2026-07-07
+- Branch: `funnel_main`
+- Amac: `Ozet` sekmesine veri-temelli otomatik insight altyapisi eklemek.
+- Etkilenen dosyalar: `process_data.py`, `SON_DURUM.md`
+- Davranis degisimi:
+  - `Ozet` sekmesinde en ustte `0) Insights (otomatik)` bolumu uretiliyor.
+  - Insight cümleleri sadece mevcut rapor verilerinden yaziliyor; eksik bilgi uretilemiyor.
+  - Revenue varsa toplam + platform paylari insight olarak ekleniyor.
+  - Android/iOS icin guvenilir band, event toplamlari ve churn hotspot ozetleri ekleniyor.
+- Dogrulama: `python -m py_compile process_data.py` (terminal sonucunda exit bilgisi donmedigi icin kullanici tarafinda tekrar calistirma onerilir).
+- Risk/Not: Insight metinleri export kapsamiyla sinirlidir; ROAS, retention, rating gibi harici metrikler yalnizca veri eklenirse yazilabilir.
+- Commit: (bu guncellemeden sonra eklenecek)
+
+---
+- Tarih: 2026-08-13
+- Branch: `funnel_main`
+- Amac: Platform (Android/iOS) olmayan, App version / network kirilimli
+  Wool Jam tarzi Excel export'larini okuyabilmek.
+- Etkilenen dosyalar: `process_data.py`, `SON_DURUM.md`
+- Davranis degisimi:
+  - `Operating system` / `Platform` yoksa dosya atlanmaz; Level + metrikler okunur.
+  - `Event name`, `App version`, `user_network` boyut kolonlari metrik sayilmaz.
+  - Ayni level birden fazla satira kirilmissa sayimlar toplanir.
+  - `avarage_attempt` / `avg_thinktime` calculated metric olarak oldugu gibi yazilir.
+  - Platform yoksa And / IOS / both sorulur (Enter = And).
+- Dogrulama: Wool Jam Free form dosyalarinda Start/Complete/Fail/Tryagain/ADs
+  satir sayilari ve L1 metrikleri; `python -m py_compile process_data.py`.
+- Risk/Not: Platform'siz export And ve IOS'u ayiramaz; analitikten Platform
+  kolonu ile almak tercih edilir.
+- Commit: (bu guncellemeden sonra eklenecek)
+
+---
+- Tarih: 2026-08-13
+- Branch: `funnel_main`
+- Amac: `top_levels_by_purchase_count_game_breakdown` CSV IAP'lerini Total $'a yazmak.
+- Etkilenen dosyalar: `process_data.py`, `.gitignore`, `SON_DURUM.md`
+- Davranis degisimi:
+  - `detailed_level_table` yoksa purchase breakdown CSV okunur.
+  - `Lv. 23` ve `$31` parse edilir; `Game` kolonu oyun adiyla filtrelenir.
+  - Platform yoksa gelir funnel sekmesine yazilir.
+- Dogrulama: Wool Jam CSV L23=$31, L16=$3; `python -m py_compile process_data.py`.
+- Risk/Not: Analiz max_level disindaki IAP (or. L271/L440) N sutununa yazilmaz.
+- Commit: (bu guncellemeden sonra eklenecek)
+
+---
+- Tarih: 2026-09-07
+- Branch: `main`
+- Amac: `funnel_main` icerigini `main` yapmak; tek branch ile devam.
+- Etkilenen dosyalar: `.gitignore`, `.vscode/*`, `SON_DURUM.md`
+- Davranis degisimi:
+  - Launch/task workspaceFolder ile acilir (eski sabit yol yok).
+  - Purchase breakdown CSV ignore listesine eklendi.
+  - Kanonik branch artik `main`.
+- Dogrulama: `git checkout main`, `git merge funnel_main`, push.
+- Risk/Not: `funnel_main` gecici tutulabilir; yeni is `main` uzerinde.
+- Commit: (bu guncellemeden sonra eklenecek)

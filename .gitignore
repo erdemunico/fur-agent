@@ -10,6 +10,8 @@
 # Gelir / veri CSV (yerel exportlar)
 veri-*.csv
 *detailed_level_table*.csv
+*top_levels_by_purchase*.csv
+*purchase_count_game_breakdown*.csv
 
 # Script debug / yerel log
 debug-fb19ec.log

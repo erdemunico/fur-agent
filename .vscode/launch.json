@@ -2,20 +2,29 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Hole Pool: process_data.py",
+      "name": "Fur Agent: process_data.py",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/process_data.py",
+      "program": "${workspaceFolder}\\process_data.py",
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "python": "${command:python.interpreterPath}",
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
     },
     {
-      "name": "Python: current file",
-      "type": "debugpy",
+      "name": "Fur Agent: process_data.py (python type)",
+      "type": "python",
       "request": "launch",
-      "program": "${file}",
+      "program": "${workspaceFolder}\\process_data.py",
       "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal"
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
     }
   ]
 }
