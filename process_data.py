@@ -826,10 +826,40 @@ def _format_churn_hotspot_label(item, metric_labels=None):
     )
 
 
+def _rewrite_same_column_range_end(formula, last_row):
+    """
+    Formalde ayni kolon araliklarinin bitisini last_row yapar; baslangic korunur.
+    Ornek: AVERAGE(R3:R402) -> AVERAGE(R3:R{last_row})
+           AVERAGE(T13:T302) -> AVERAGE(T13:T{last_row})
+    """
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return formula
+
+    def _repl(m):
+        c1, r1, c2 = m.group(1), m.group(2), m.group(3)
+        if c1.upper() != c2.upper():
+            return m.group(0)
+        return f"{c1}{r1}:{c2}{last_row}"
+
+    return re.sub(
+        r"([A-Za-z]+)(\d+):([A-Za-z]+)(\d+)",
+        _repl,
+        formula,
+    )
+
+
+def _rewrite_trailing_level_divisor(formula, max_level):
+    """ARPU tarzi =(N1/C3)/300 -> /max_level."""
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return formula
+    return re.sub(r"/(\d+)\s*$", f"/{int(max_level)}", formula.strip())
+
+
 def write_row1_owned_avg_coin_averages(wb, sheet_name, max_level):
     """
-    And / IOS: 1. satira Owned Coin ve Avg. Coin sutunlarinin
-    level veri satirlari (1..max_level) uzerinden AVERAGE formulu.
+    And / IOS 1. satir ozet formullleri: secilen max_level'e gore aralik bitisini
+    gunceller (R/S AVERAGE, N SUM, T/U/V AVERAGE, O ARPU bolen vb.).
+    Owned Coin / Avg. Coin AVERAGE'i da ayni last_row ile yazilir.
     """
     if sheet_name not in ("And", "IOS"):
         return
@@ -841,6 +871,20 @@ def write_row1_owned_avg_coin_averages(wb, sheet_name, max_level):
         return
     first_row = level_rows.get(1, 3)
     last_row = level_rows.get(max_level, max_level + 2)
+
+    max_c = ws.max_column or 0
+    for c in range(1, max_c + 1):
+        cell = ws.cell(row=1, column=c)
+        val = cell.value
+        if not isinstance(val, str) or not val.startswith("="):
+            continue
+        updated = _rewrite_same_column_range_end(val, last_row)
+        # O (ARPU): /(sabit level) bolenini max_level yap
+        header2 = _norm_header_cell_text(ws.cell(row=2, column=c).value)
+        if c == 15 or "arpu" in header2:
+            updated = _rewrite_trailing_level_divisor(updated, max_level)
+        if updated != val:
+            cell.value = updated
 
     col_owned = _find_column_by_header_keywords(ws, ("owned coin", "coin owned"))
     skip = frozenset([col_owned]) if col_owned is not None else frozenset()

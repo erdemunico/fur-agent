@@ -44,6 +44,8 @@ Bu dosya, projede degisiklik yaparken once neyin korunacagini netlestirmek ve
 - `U` kolonu: owned coin / complete
 - `U1`: sadece baslik varsa yazilir (otomatik X/24 olusturma yok)
 - `Owned Coin` ve `Avg. Coin` icin 1. satira ortalama yazilir.
+- 1. satir ozet formulleri (R/S AVERAGE, N SUM, O ARPU boleni, Q/T/U/V vb.)
+  secilen `max_level`'e gore bitis satiri guncellenir (sablondaki sabit 402 kalmaz).
 
 ### ARPU / Av.Rw
 - Referans sayfalar kopyalanir (grafiklerle birlikte).
